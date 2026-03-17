@@ -27,6 +27,19 @@ E o sistema automaticamente:
 - 🔍 Consulta por categoria
 - ⚠️ Alertas de gastos
 
+## 💬 Comandos de Consulta (WhatsApp)
+
+Use em conversa privada com o bot:
+
+- `resumo do mes`
+- `total do mes`
+- `total por categoria`
+- `total alimentação no mes`
+- `total transporte no mes`
+- `total lazer no mes`
+- `resumo 03/2026`
+- `ajuda` (lista comandos)
+
 ---
 
 ## 🏗️ Arquitetura (MVP)

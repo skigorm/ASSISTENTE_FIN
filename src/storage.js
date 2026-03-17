@@ -1,6 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
-const { logError, logInfo, sanitizeText } = require('./utils');
+const { ALLOWED_CATEGORIES, logError, logInfo, sanitizeText } = require('./utils');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const TRANSACTIONS_FILE = path.join(DATA_DIR, 'transactions.json');
@@ -81,8 +81,81 @@ async function getTransactionsByUser(user) {
   return list.filter((item) => item.user === user);
 }
 
+function buildEmptyCategoryTotals() {
+  return ALLOWED_CATEGORIES.reduce((accumulator, category) => {
+    accumulator[category] = 0;
+    return accumulator;
+  }, {});
+}
+
+function roundTo2(value) {
+  return Number(value.toFixed(2));
+}
+
+async function getMonthlySummaryByUser(user, year, month) {
+  const userTransactions = await getTransactionsByUser(user);
+  const safeYear = Number.parseInt(String(year), 10);
+  const safeMonth = Number.parseInt(String(month), 10);
+
+  if (!Number.isInteger(safeYear) || !Number.isInteger(safeMonth) || safeMonth < 1 || safeMonth > 12) {
+    return {
+      year: safeYear,
+      month: safeMonth,
+      total: 0,
+      count: 0,
+      byCategory: buildEmptyCategoryTotals(),
+      transactions: []
+    };
+  }
+
+  const monthPrefix = `${safeYear}-${String(safeMonth).padStart(2, '0')}-`;
+  const byCategory = buildEmptyCategoryTotals();
+  const monthTransactions = [];
+
+  for (const transaction of userTransactions) {
+    if (
+      !transaction ||
+      typeof transaction.data !== 'string' ||
+      !transaction.data.startsWith(monthPrefix)
+    ) {
+      continue;
+    }
+
+    const value = Number(transaction.valor);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      continue;
+    }
+
+    const category = ALLOWED_CATEGORIES.includes(transaction.categoria)
+      ? transaction.categoria
+      : 'Outros';
+
+    byCategory[category] = roundTo2(byCategory[category] + value);
+    monthTransactions.push({
+      user: transaction.user,
+      valor: roundTo2(value),
+      categoria: category,
+      descricao: sanitizeText(transaction.descricao),
+      data: transaction.data
+    });
+  }
+
+  const total = roundTo2(monthTransactions.reduce((sum, item) => sum + item.valor, 0));
+
+  return {
+    year: safeYear,
+    month: safeMonth,
+    total,
+    count: monthTransactions.length,
+    byCategory,
+    transactions: monthTransactions
+  };
+}
+
 module.exports = {
   TRANSACTIONS_FILE,
+  getMonthlySummaryByUser,
   getTransactionsByUser,
   readAllTransactions,
   saveTransaction

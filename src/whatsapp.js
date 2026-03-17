@@ -1,8 +1,9 @@
 const path = require('path');
 const baileys = require('@whiskeysockets/baileys');
 const { parseTransactionWithAI } = require('./ai');
-const { saveTransaction } = require('./storage');
+const { getMonthlySummaryByUser, saveTransaction } = require('./storage');
 const {
+  ALLOWED_CATEGORIES,
   fallbackParseTransaction,
   formatCurrencyBRL,
   isLikelyPromotionalText,
@@ -155,6 +156,225 @@ function buildSuccessMessage(transaction) {
   ].join('\n');
 }
 
+function stripAccents(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function normalizeCommandText(text) {
+  return stripAccents(sanitizeText(text).toLowerCase());
+}
+
+function isHelpCommand(commandText) {
+  return /^(\/)?(ajuda|comandos?)\b/.test(commandText);
+}
+
+function hasMonthlySummaryIntent(commandText) {
+  if (/^\/?(resumo|relatorio)\b/.test(commandText)) {
+    return true;
+  }
+
+  if (/quanto\s+gastei/.test(commandText)) {
+    return true;
+  }
+
+  if (/(total|gastos?)\s+(do|no|nesse|neste)?\s*mes/.test(commandText)) {
+    return true;
+  }
+
+  if (/por\s+categoria/.test(commandText)) {
+    return true;
+  }
+
+  if (/^\/?total\s+(alimentacao|transporte|lazer|outros)\b/.test(commandText)) {
+    return true;
+  }
+
+  return false;
+}
+
+function extractRequestedCategory(commandText) {
+  if (/\b(alimentacao|mercado|ifood|comida|restaurante|lanche)\b/.test(commandText)) {
+    return 'Alimentação';
+  }
+
+  if (/\b(transporte|uber|taxi|onibus|metro|combustivel|gasolina|passagem)\b/.test(commandText)) {
+    return 'Transporte';
+  }
+
+  if (/\b(lazer|entretenimento|cinema|bar|show|netflix|spotify|viagem)\b/.test(commandText)) {
+    return 'Lazer';
+  }
+
+  if (/\b(outros?)\b/.test(commandText)) {
+    return 'Outros';
+  }
+
+  return null;
+}
+
+function resolveSummaryMonth(commandText, referenceDate = new Date()) {
+  const resolved = new Date(referenceDate);
+  const monthYearMatch = commandText.match(/\b(0?[1-9]|1[0-2])[\/-](20\d{2})\b/);
+
+  if (monthYearMatch) {
+    const month = Number.parseInt(monthYearMatch[1], 10);
+    const year = Number.parseInt(monthYearMatch[2], 10);
+
+    return {
+      year,
+      month,
+      label: `${String(month).padStart(2, '0')}/${year}`
+    };
+  }
+
+  if (/\bmes\s+passado\b/.test(commandText)) {
+    resolved.setDate(1);
+    resolved.setMonth(resolved.getMonth() - 1);
+  }
+
+  const monthMap = {
+    janeiro: 1,
+    fevereiro: 2,
+    marco: 3,
+    abril: 4,
+    maio: 5,
+    junho: 6,
+    julho: 7,
+    agosto: 8,
+    setembro: 9,
+    outubro: 10,
+    novembro: 11,
+    dezembro: 12
+  };
+
+  for (const [name, month] of Object.entries(monthMap)) {
+    if (commandText.includes(name)) {
+      resolved.setMonth(month - 1);
+      break;
+    }
+  }
+
+  const yearMatch = commandText.match(/\b(20\d{2})\b/);
+
+  if (yearMatch) {
+    resolved.setFullYear(Number.parseInt(yearMatch[1], 10));
+  }
+
+  const year = resolved.getFullYear();
+  const month = resolved.getMonth() + 1;
+
+  return {
+    year,
+    month,
+    label: `${String(month).padStart(2, '0')}/${year}`
+  };
+}
+
+function buildMonthlySummaryMessage(summary, monthLabel) {
+  if (!summary.count) {
+    return `📊 Nenhum gasto encontrado em ${monthLabel}.`;
+  }
+
+  const lines = [
+    `📊 Resumo de ${monthLabel}:`,
+    `Total: ${formatCurrencyBRL(summary.total)}`,
+    `Lançamentos: ${summary.count}`,
+    '',
+    'Por categoria:'
+  ];
+
+  for (const category of ALLOWED_CATEGORIES) {
+    lines.push(`- ${category}: ${formatCurrencyBRL(summary.byCategory[category] || 0)}`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildCategorySummaryMessage(category, monthLabel, categoryTotal, categoryCount) {
+  if (!categoryCount) {
+    return `📊 Nenhum gasto de ${category.toLowerCase()} encontrado em ${monthLabel}.`;
+  }
+
+  return [
+    `📊 ${category} em ${monthLabel}:`,
+    `Total: ${formatCurrencyBRL(categoryTotal)}`,
+    `Lançamentos: ${categoryCount}`
+  ].join('\n');
+}
+
+function buildHelpMessage() {
+  return [
+    'Comandos disponíveis:',
+    '- resumo do mes',
+    '- total do mes',
+    '- total por categoria',
+    '- total alimentação no mes',
+    '- resumo 03/2026',
+    '',
+    'Para registrar gasto, continue enviando mensagens normais, ex:',
+    'gastei 45 no mercado'
+  ].join('\n');
+}
+
+async function tryHandleFinanceCommand(sock, jid, userNumber, text, referenceDate) {
+  const commandText = normalizeCommandText(text);
+
+  if (isHelpCommand(commandText)) {
+    await safeReply(sock, jid, buildHelpMessage());
+    return true;
+  }
+
+  if (!hasMonthlySummaryIntent(commandText)) {
+    return false;
+  }
+
+  const requestedCategory = extractRequestedCategory(commandText);
+  const resolvedMonth = resolveSummaryMonth(commandText, referenceDate);
+  const summary = await getMonthlySummaryByUser(
+    userNumber,
+    resolvedMonth.year,
+    resolvedMonth.month
+  );
+
+  if (requestedCategory) {
+    const categoryTotal = Number(summary.byCategory[requestedCategory] || 0);
+    const categoryCount = summary.transactions.filter(
+      (item) => item.categoria === requestedCategory
+    ).length;
+
+    await safeReply(
+      sock,
+      jid,
+      buildCategorySummaryMessage(
+        requestedCategory,
+        resolvedMonth.label,
+        categoryTotal,
+        categoryCount
+      )
+    );
+
+    logInfo('WHATSAPP', 'Resumo por categoria enviado.', {
+      user: userNumber,
+      category: requestedCategory,
+      month: resolvedMonth.label,
+      total: categoryTotal,
+      count: categoryCount
+    });
+    return true;
+  }
+
+  await safeReply(sock, jid, buildMonthlySummaryMessage(summary, resolvedMonth.label));
+  logInfo('WHATSAPP', 'Resumo mensal enviado.', {
+    user: userNumber,
+    month: resolvedMonth.label,
+    total: summary.total,
+    count: summary.count
+  });
+  return true;
+}
+
 function isSupportedDirectChat(jid) {
   if (!jid || typeof jid !== 'string') {
     return false;
@@ -231,6 +451,19 @@ async function processIncomingMessage(sock, message) {
     }
 
     const referenceDate = new Date();
+
+    const commandHandled = await tryHandleFinanceCommand(
+      sock,
+      jid,
+      userNumber,
+      text,
+      referenceDate
+    );
+
+    if (commandHandled) {
+      return;
+    }
+
     let transaction = await parseTransactionWithAI(text, referenceDate);
 
     if (!transaction) {
