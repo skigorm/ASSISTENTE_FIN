@@ -28,6 +28,18 @@ const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
 const RECONNECT_DELAY_MS = 5000;
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 
+const silentBaileysLogger = {
+  level: 'silent',
+  child() {
+    return silentBaileysLogger;
+  },
+  trace() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {}
+};
+
 let activeSocket = null;
 let isStarting = false;
 let reconnectTimer = null;
@@ -142,14 +154,12 @@ async function processIncomingMessage(sock, message) {
     const jid = message.key ? message.key.remoteJid : null;
 
     if (!isSupportedDirectChat(jid)) {
-      logInfo('WHATSAPP', 'Mensagem ignorada por tipo de chat não suportado.', { jid });
       return;
     }
 
     const rawText = extractTextMessage(message.message);
 
     if (!rawText) {
-      logInfo('WHATSAPP', 'Mensagem ignorada (não é texto).', { jid });
       return;
     }
 
@@ -322,7 +332,10 @@ async function createSocket() {
 
   const socketConfig = {
     auth: state,
+    logger: silentBaileysLogger,
     markOnlineOnConnect: false,
+    shouldIgnoreJid: (jid) => !isSupportedDirectChat(jid),
+    shouldSyncHistoryMessage: () => false,
     syncFullHistory: false
   };
 
