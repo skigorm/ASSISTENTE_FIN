@@ -11,6 +11,14 @@ const {
   normalizeUserId,
   sanitizeText
 } = require('./utils');
+const {
+  setWhatsAppConnected,
+  setWhatsAppConnecting,
+  setWhatsAppDisconnected,
+  setWhatsAppLoggedOut,
+  setWhatsAppPairingCode,
+  setWhatsAppWaitingQr
+} = require('./whatsappState');
 
 const makeWASocket = baileys.default;
 const { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = baileys;
@@ -210,11 +218,13 @@ function createConnectionUpdateHandler(sock, state) {
         const pairingNumber = getPairingNumber();
 
         if (!pairingNumber) {
+          setWhatsAppWaitingQr(qr);
+
           if (!pairingHintLogged) {
             pairingHintLogged = true;
             logWarn(
               'WHATSAPP',
-              `QR gerado, mas o terminal QR foi descontinuado no Baileys. Configure ${PAIRING_NUMBER_ENV} para receber código de pareamento.`
+              'QR gerado. Acesse /pairing no navegador para escanear.'
             );
           }
         } else if (!pairingCodeRequested) {
@@ -222,6 +232,7 @@ function createConnectionUpdateHandler(sock, state) {
 
           try {
             const code = await sock.requestPairingCode(pairingNumber);
+            setWhatsAppPairingCode();
             logInfo(
               'WHATSAPP',
               `Código de pareamento: ${formatPairingCode(code)}. No celular: Dispositivos conectados -> Conectar com número de telefone.`
@@ -234,6 +245,7 @@ function createConnectionUpdateHandler(sock, state) {
       }
 
       if (connection === 'open') {
+        setWhatsAppConnected();
         logInfo('WHATSAPP', 'Conexão estabelecida com sucesso.');
         return;
       }
@@ -250,12 +262,14 @@ function createConnectionUpdateHandler(sock, state) {
           statusCode,
           shouldReconnect
         });
+        setWhatsAppDisconnected({ statusCode, shouldReconnect });
 
         activeSocket = null;
 
         if (shouldReconnect) {
           scheduleReconnect();
         } else {
+          setWhatsAppLoggedOut();
           logWarn('WHATSAPP', 'Sessão deslogada. Faça novo pareamento para continuar.');
         }
       }
@@ -287,6 +301,7 @@ async function createSocket() {
     socketConfig.version = version;
   }
 
+  setWhatsAppConnecting();
   const sock = makeWASocket(socketConfig);
 
   sock.ev.on('creds.update', async () => {
