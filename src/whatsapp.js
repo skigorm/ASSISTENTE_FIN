@@ -27,6 +27,8 @@ const { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = b
 const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
 const RECONNECT_DELAY_MS = 5000;
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
+const MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_MESSAGES';
+const IGNORED_MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_IGNORED_MESSAGES';
 
 const silentBaileysLogger = {
   level: 'silent',
@@ -43,6 +45,24 @@ const silentBaileysLogger = {
 let activeSocket = null;
 let isStarting = false;
 let reconnectTimer = null;
+
+function isEnvEnabled(name, defaultValue = false) {
+  const value = String(process.env[name] || '').trim().toLowerCase();
+
+  if (!value) {
+    return defaultValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(value);
+}
+
+function shouldLogMessages() {
+  return isEnvEnabled(MESSAGE_LOGS_ENV, true);
+}
+
+function shouldLogIgnoredMessages() {
+  return isEnvEnabled(IGNORED_MESSAGE_LOGS_ENV, false);
+}
 
 function getPairingNumber() {
   return String(process.env[PAIRING_NUMBER_ENV] || '').replace(/\D/g, '');
@@ -104,7 +124,21 @@ function extractTextMessage(messageContent) {
 
 async function safeReply(sock, jid, text) {
   try {
+    if (shouldLogMessages()) {
+      logInfo('WHATSAPP', 'Enviando mensagem.', {
+        jid,
+        text: sanitizeText(text)
+      });
+    }
+
     await sock.sendMessage(jid, { text });
+
+    if (shouldLogMessages()) {
+      logInfo('WHATSAPP', 'Mensagem enviada com sucesso.', {
+        jid,
+        text: sanitizeText(text)
+      });
+    }
   } catch (error) {
     logError('WHATSAPP', 'Falha ao enviar resposta ao usuário.', {
       jid,
@@ -151,19 +185,33 @@ function isSupportedDirectChat(jid) {
 
 async function processIncomingMessage(sock, message) {
   try {
-    if (!message || !message.message || (message.key && message.key.fromMe)) {
+    if (!message || !message.message) {
       return;
     }
 
     const jid = message.key ? message.key.remoteJid : null;
+    const fromMe = message.key && message.key.fromMe;
+
+    if (fromMe) {
+      if (shouldLogIgnoredMessages()) {
+        logInfo('WHATSAPP', 'Mensagem ignorada (fromMe=true).', { jid });
+      }
+      return;
+    }
 
     if (!isSupportedDirectChat(jid)) {
+      if (shouldLogIgnoredMessages()) {
+        logInfo('WHATSAPP', 'Mensagem ignorada (chat não suportado).', { jid });
+      }
       return;
     }
 
     const rawText = extractTextMessage(message.message);
 
     if (!rawText) {
+      if (shouldLogIgnoredMessages()) {
+        logInfo('WHATSAPP', 'Mensagem ignorada (não é texto).', { jid });
+      }
       return;
     }
 
@@ -174,7 +222,13 @@ async function processIncomingMessage(sock, message) {
     }
 
     const userNumber = normalizeUserId(jid);
-    logInfo('WHATSAPP', 'Mensagem recebida.', { user: userNumber, text });
+    if (shouldLogMessages()) {
+      logInfo('WHATSAPP', 'Mensagem recebida.', {
+        jid,
+        user: userNumber,
+        text
+      });
+    }
 
     const referenceDate = new Date();
     let transaction = await parseTransactionWithAI(text, referenceDate);
