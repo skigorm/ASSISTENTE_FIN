@@ -142,6 +142,10 @@ function isSupportedDirectChat(jid) {
     return true;
   }
 
+  if (jid.endsWith('@lid')) {
+    return true;
+  }
+
   return false;
 }
 
