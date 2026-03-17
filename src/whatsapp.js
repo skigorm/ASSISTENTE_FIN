@@ -17,10 +17,26 @@ const { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = b
 
 const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
 const RECONNECT_DELAY_MS = 5000;
+const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 
 let activeSocket = null;
 let isStarting = false;
 let reconnectTimer = null;
+
+function getPairingNumber() {
+  return String(process.env[PAIRING_NUMBER_ENV] || '').replace(/\D/g, '');
+}
+
+function formatPairingCode(rawCode) {
+  const code = sanitizeText(String(rawCode || '')).replace(/\s+/g, '').toUpperCase();
+
+  if (!code) {
+    return '';
+  }
+
+  const chunks = code.match(/.{1,4}/g);
+  return chunks ? chunks.join('-') : code;
+}
 
 function unwrapMessageContent(messageContent) {
   let current = messageContent;
@@ -180,40 +196,73 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY_MS);
 }
 
-function handleConnectionUpdate(update) {
-  try {
-    const connection = update ? update.connection : null;
-    const lastDisconnect = update ? update.lastDisconnect : null;
+function createConnectionUpdateHandler(sock, state) {
+  let pairingCodeRequested = false;
+  let pairingHintLogged = false;
 
-    if (connection === 'open') {
-      logInfo('WHATSAPP', 'Conexão estabelecida com sucesso.');
-      return;
-    }
+  return async (update) => {
+    try {
+      const connection = update ? update.connection : null;
+      const lastDisconnect = update ? update.lastDisconnect : null;
+      const qr = update ? update.qr : null;
 
-    if (connection === 'close') {
-      const statusCode = lastDisconnect &&
-        lastDisconnect.error &&
-        lastDisconnect.error.output
-        ? lastDisconnect.error.output.statusCode
-        : undefined;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      if (qr && !state.creds.registered) {
+        const pairingNumber = getPairingNumber();
 
-      logWarn('WHATSAPP', 'Conexão encerrada.', {
-        statusCode,
-        shouldReconnect
-      });
+        if (!pairingNumber) {
+          if (!pairingHintLogged) {
+            pairingHintLogged = true;
+            logWarn(
+              'WHATSAPP',
+              `QR gerado, mas o terminal QR foi descontinuado no Baileys. Configure ${PAIRING_NUMBER_ENV} para receber código de pareamento.`
+            );
+          }
+        } else if (!pairingCodeRequested) {
+          pairingCodeRequested = true;
 
-      activeSocket = null;
-
-      if (shouldReconnect) {
-        scheduleReconnect();
-      } else {
-        logWarn('WHATSAPP', 'Sessão deslogada. Faça novo pareamento via QR Code.');
+          try {
+            const code = await sock.requestPairingCode(pairingNumber);
+            logInfo(
+              'WHATSAPP',
+              `Código de pareamento: ${formatPairingCode(code)}. No celular: Dispositivos conectados -> Conectar com número de telefone.`
+            );
+          } catch (error) {
+            pairingCodeRequested = false;
+            logError('WHATSAPP', 'Falha ao solicitar código de pareamento.', error.message);
+          }
+        }
       }
+
+      if (connection === 'open') {
+        logInfo('WHATSAPP', 'Conexão estabelecida com sucesso.');
+        return;
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect &&
+          lastDisconnect.error &&
+          lastDisconnect.error.output
+          ? lastDisconnect.error.output.statusCode
+          : undefined;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        logWarn('WHATSAPP', 'Conexão encerrada.', {
+          statusCode,
+          shouldReconnect
+        });
+
+        activeSocket = null;
+
+        if (shouldReconnect) {
+          scheduleReconnect();
+        } else {
+          logWarn('WHATSAPP', 'Sessão deslogada. Faça novo pareamento para continuar.');
+        }
+      }
+    } catch (error) {
+      logError('WHATSAPP', 'Erro ao tratar atualização de conexão.', error.message);
     }
-  } catch (error) {
-    logError('WHATSAPP', 'Erro ao tratar atualização de conexão.', error.message);
-  }
+  };
 }
 
 async function createSocket() {
@@ -231,7 +280,6 @@ async function createSocket() {
   const socketConfig = {
     auth: state,
     markOnlineOnConnect: false,
-    printQRInTerminal: true,
     syncFullHistory: false
   };
 
@@ -249,7 +297,11 @@ async function createSocket() {
     }
   });
 
-  sock.ev.on('connection.update', handleConnectionUpdate);
+  const handleConnectionUpdate = createConnectionUpdateHandler(sock, state);
+
+  sock.ev.on('connection.update', async (update) => {
+    await handleConnectionUpdate(update);
+  });
   sock.ev.on('messages.upsert', async (event) => {
     await handleMessagesUpsert(sock, event);
   });
