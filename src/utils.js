@@ -317,6 +317,29 @@ function fallbackParseTransaction(text, referenceDate = new Date()) {
   return validation.valid ? validation.data : null;
 }
 
+function isLikelyPromotionalText(text) {
+  const normalized = sanitizeText(text).toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  const hasUrl = /(https?:\/\/|www\.)/i.test(normalized);
+  const hasPromoKeyword = /(oferta|promo[cç][aã]o|cupom|desconto|imperd[ií]vel|frete|kit\s+\d+|de\s*~?\s*\d|por\s*\*?\s*\d|mercadolivre|shopee)/i.test(normalized);
+  const hasPromoSymbols = /[🔥✅🔗]/.test(text);
+  const looksBroadcastCopy = normalized.length > 140;
+
+  if (hasUrl && (hasPromoKeyword || hasPromoSymbols || looksBroadcastCopy)) {
+    return true;
+  }
+
+  if ((hasPromoKeyword || hasPromoSymbols) && looksBroadcastCopy) {
+    return true;
+  }
+
+  return false;
+}
+
 function normalizeUserId(jid) {
   if (typeof jid !== 'string') {
     return 'desconhecido';
@@ -337,6 +360,7 @@ module.exports = {
   extractJSONObject,
   fallbackParseTransaction,
   formatCurrencyBRL,
+  isLikelyPromotionalText,
   logError,
   logInfo,
   logWarn,

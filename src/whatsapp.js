@@ -5,6 +5,7 @@ const { saveTransaction } = require('./storage');
 const {
   fallbackParseTransaction,
   formatCurrencyBRL,
+  isLikelyPromotionalText,
   logError,
   logInfo,
   logWarn,
@@ -108,6 +109,30 @@ function buildSuccessMessage(transaction) {
   ].join('\n');
 }
 
+function isSupportedDirectChat(jid) {
+  if (!jid || typeof jid !== 'string') {
+    return false;
+  }
+
+  if (jid.endsWith('@broadcast')) {
+    return false;
+  }
+
+  if (jid.endsWith('@g.us')) {
+    return false;
+  }
+
+  if (jid.endsWith('@newsletter')) {
+    return false;
+  }
+
+  if (jid.endsWith('@s.whatsapp.net')) {
+    return true;
+  }
+
+  return false;
+}
+
 async function processIncomingMessage(sock, message) {
   try {
     if (!message || !message.message || (message.key && message.key.fromMe)) {
@@ -116,12 +141,8 @@ async function processIncomingMessage(sock, message) {
 
     const jid = message.key ? message.key.remoteJid : null;
 
-    if (!jid || jid.endsWith('@broadcast')) {
-      return;
-    }
-
-    if (jid.endsWith('@g.us')) {
-      logInfo('WHATSAPP', 'Mensagem de grupo ignorada.', { jid });
+    if (!isSupportedDirectChat(jid)) {
+      logInfo('WHATSAPP', 'Mensagem ignorada por tipo de chat não suportado.', { jid });
       return;
     }
 
@@ -145,6 +166,14 @@ async function processIncomingMessage(sock, message) {
     let transaction = await parseTransactionWithAI(text, referenceDate);
 
     if (!transaction) {
+      if (isLikelyPromotionalText(text)) {
+        logInfo('WHATSAPP', 'Mensagem promocional ignorada para evitar falso positivo.', {
+          user: userNumber,
+          jid
+        });
+        return;
+      }
+
       transaction = fallbackParseTransaction(text, referenceDate);
 
       if (transaction) {

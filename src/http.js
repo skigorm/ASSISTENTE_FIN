@@ -78,6 +78,22 @@ function buildPairingPageHtml() {
       max-width: 100%;
       height: auto;
     }
+    .actions {
+      margin-top: 12px;
+      margin-bottom: 8px;
+    }
+    .btn {
+      border: 0;
+      border-radius: 8px;
+      background: #111827;
+      color: #ffffff;
+      padding: 8px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn:hover {
+      background: #1f2937;
+    }
     .hint {
       margin-top: 12px;
       font-size: 13px;
@@ -95,12 +111,16 @@ function buildPairingPageHtml() {
       <p class="sub">Escaneie o QR abaixo em <strong>Dispositivos conectados</strong>.</p>
       <div id="status">Carregando status...</div>
       <div id="qr-box"><span>Nenhum QR disponível no momento.</span></div>
-      <p class="hint">A página atualiza automaticamente a cada 3 segundos.</p>
+      <div class="actions">
+        <button id="refresh-btn" class="btn" type="button">Atualizar Status</button>
+      </div>
+      <p class="hint">Sem atualização automática para reduzir chamadas no servidor.</p>
     </div>
   </div>
   <script>
     const statusEl = document.getElementById('status');
     const qrBoxEl = document.getElementById('qr-box');
+    const refreshBtnEl = document.getElementById('refresh-btn');
     let lastUpdatedAt = '';
 
     function renderStatus(whatsapp) {
@@ -131,7 +151,7 @@ function buildPairingPageHtml() {
     }
 
     refresh();
-    setInterval(refresh, 3000);
+    refreshBtnEl.addEventListener('click', refresh);
   </script>
 </body>
 </html>`;
