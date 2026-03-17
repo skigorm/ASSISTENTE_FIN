@@ -1,4 +1,5 @@
 const express = require('express');
+const QRCode = require('qrcode');
 const { logError, logInfo } = require('./utils');
 const { getWhatsAppState } = require('./whatsappState');
 
@@ -72,7 +73,8 @@ function buildPairingPageHtml() {
       background: #fafafa;
       overflow: hidden;
     }
-    #qr-box canvas {
+    #qr-box img {
+      width: 300px;
       max-width: 100%;
       height: auto;
     }
@@ -85,7 +87,6 @@ function buildPairingPageHtml() {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
 </head>
 <body>
   <div class="wrap">
@@ -100,21 +101,11 @@ function buildPairingPageHtml() {
   <script>
     const statusEl = document.getElementById('status');
     const qrBoxEl = document.getElementById('qr-box');
-    let lastQr = '';
+    let lastUpdatedAt = '';
 
     function renderStatus(whatsapp) {
       const text = (whatsapp.message || 'Sem status') + ' (' + (whatsapp.status || 'unknown') + ')';
       statusEl.textContent = text;
-    }
-
-    async function drawQr(qr) {
-      qrBoxEl.innerHTML = '';
-      const canvas = document.createElement('canvas');
-      qrBoxEl.appendChild(canvas);
-      await QRCode.toCanvas(canvas, qr, {
-        width: 300,
-        margin: 1
-      });
     }
 
     async function refresh() {
@@ -125,12 +116,13 @@ function buildPairingPageHtml() {
         renderStatus(whatsapp);
 
         if (whatsapp.qr) {
-          if (lastQr !== whatsapp.qr) {
-            lastQr = whatsapp.qr;
-            await drawQr(whatsapp.qr);
+          if (lastUpdatedAt !== whatsapp.updatedAt) {
+            lastUpdatedAt = whatsapp.updatedAt;
+            const url = '/pairing/qr?v=' + encodeURIComponent(whatsapp.updatedAt || Date.now());
+            qrBoxEl.innerHTML = '<img alt="QR Code WhatsApp" src="' + url + '" />';
           }
         } else {
-          lastQr = '';
+          lastUpdatedAt = '';
           qrBoxEl.innerHTML = '<span>Nenhum QR disponível no momento.</span>';
         }
       } catch (error) {
@@ -186,6 +178,28 @@ function createHttpApp() {
         qr: whatsapp.qr
       }
     });
+  });
+
+  app.get('/pairing/qr', async (_req, res, next) => {
+    try {
+      const whatsapp = getWhatsAppState();
+
+      if (!whatsapp.qr) {
+        res.status(404).type('text/plain').send('QR indisponível no momento.');
+        return;
+      }
+
+      const svg = await QRCode.toString(whatsapp.qr, {
+        type: 'svg',
+        width: 320,
+        margin: 1
+      });
+
+      res.set('Cache-Control', 'no-store');
+      res.status(200).type('image/svg+xml').send(svg);
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.use((error, req, res, next) => {
