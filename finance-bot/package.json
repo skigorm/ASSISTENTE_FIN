@@ -1,0 +1,19 @@
+{
+  "name": "finance-bot",
+  "version": "1.0.0",
+  "description": "MVP de bot financeiro via WhatsApp",
+  "main": "src/app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "node src/app.js"
+  },
+  "engines": {
+    "node": ">=23.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7"
+  }
+}
