@@ -554,7 +554,7 @@ function createConnectionUpdateHandler(sock, state) {
             pairingHintLogged = true;
             logWarn(
               'WHATSAPP',
-              'QR gerado. Acesse /pairing no navegador para escanear.'
+              'WHATSAPP_PAIRING_NUMBER não configurado. Defina o número para gerar código de pareamento.'
             );
           }
         } else if (!pairingCodeRequested) {
@@ -562,10 +562,11 @@ function createConnectionUpdateHandler(sock, state) {
 
           try {
             const code = await sock.requestPairingCode(pairingNumber);
-            setWhatsAppPairingCode();
+            const formattedCode = formatPairingCode(code);
+            setWhatsAppPairingCode(formattedCode);
             logInfo(
               'WHATSAPP',
-              `Código de pareamento: ${formatPairingCode(code)}. No celular: Dispositivos conectados -> Conectar com número de telefone.`
+              `Código de pareamento: ${formattedCode}. No celular: Dispositivos conectados -> Conectar com número de telefone.`
             );
           } catch (error) {
             pairingCodeRequested = false;

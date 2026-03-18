@@ -1,6 +1,7 @@
 const state = {
   status: 'idle',
   qr: null,
+  pairingCode: null,
   message: 'Aguardando inicialização do bot.',
   updatedAt: new Date().toISOString()
 };
@@ -15,23 +16,26 @@ function setWhatsAppConnecting() {
   updateState({
     status: 'connecting',
     qr: null,
+    pairingCode: null,
     message: 'Conectando ao WhatsApp...'
   });
 }
 
 function setWhatsAppWaitingQr(qr) {
   updateState({
-    status: 'waiting_qr',
-    qr,
-    message: 'Escaneie o QR Code com o WhatsApp para parear.'
+    status: 'waiting_pairing_number',
+    qr: null,
+    pairingCode: null,
+    message: 'Configure WHATSAPP_PAIRING_NUMBER para gerar código de pareamento.'
   });
 }
 
-function setWhatsAppPairingCode() {
+function setWhatsAppPairingCode(pairingCode) {
   updateState({
     status: 'waiting_pairing_code',
     qr: null,
-    message: 'Aguardando confirmação do código de pareamento no celular.'
+    pairingCode: String(pairingCode || ''),
+    message: 'Digite o código de pareamento no celular.'
   });
 }
 
@@ -39,6 +43,7 @@ function setWhatsAppConnected() {
   updateState({
     status: 'connected',
     qr: null,
+    pairingCode: null,
     message: 'WhatsApp conectado.'
   });
 }
@@ -52,6 +57,7 @@ function setWhatsAppDisconnected(meta) {
   updateState({
     status: 'disconnected',
     qr: null,
+    pairingCode: null,
     message: `Conexão encerrada${code}.${reconnect}`
   });
 }
@@ -60,6 +66,7 @@ function setWhatsAppLoggedOut() {
   updateState({
     status: 'logged_out',
     qr: null,
+    pairingCode: null,
     message: 'Sessão deslogada. Faça novo pareamento.'
   });
 }
@@ -68,6 +75,7 @@ function getWhatsAppState() {
   return {
     status: state.status,
     qr: state.qr,
+    pairingCode: state.pairingCode,
     message: state.message,
     updatedAt: state.updatedAt
   };

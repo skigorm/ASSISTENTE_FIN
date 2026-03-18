@@ -1,5 +1,4 @@
 const express = require('express');
-const QRCode = require('qrcode');
 const { logError, logInfo } = require('./utils');
 const { getWhatsAppState } = require('./whatsappState');
 
@@ -63,8 +62,8 @@ function buildPairingPageHtml() {
       background: #eef2ff;
       color: #1f2937;
     }
-    #qr-box {
-      min-height: 320px;
+    #code-box {
+      min-height: 120px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -72,11 +71,16 @@ function buildPairingPageHtml() {
       border-radius: 10px;
       background: #fafafa;
       overflow: hidden;
+      padding: 12px;
+      box-sizing: border-box;
+      text-align: center;
     }
-    #qr-box img {
-      width: 300px;
-      max-width: 100%;
-      height: auto;
+    #code-box .value {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #111827;
+      word-break: break-word;
     }
     .actions {
       margin-top: 12px;
@@ -108,9 +112,9 @@ function buildPairingPageHtml() {
   <div class="wrap">
     <div class="card">
       <h1 class="title">Parear WhatsApp</h1>
-      <p class="sub">Escaneie o QR abaixo em <strong>Dispositivos conectados</strong>.</p>
+      <p class="sub">No celular: <strong>Dispositivos conectados</strong> → <strong>Conectar com número de telefone</strong>.</p>
       <div id="status">Carregando status...</div>
-      <div id="qr-box"><span>Nenhum QR disponível no momento.</span></div>
+      <div id="code-box"><span>Nenhum código disponível no momento.</span></div>
       <div class="actions">
         <button id="refresh-btn" class="btn" type="button">Atualizar Status</button>
       </div>
@@ -119,9 +123,8 @@ function buildPairingPageHtml() {
   </div>
   <script>
     const statusEl = document.getElementById('status');
-    const qrBoxEl = document.getElementById('qr-box');
+    const codeBoxEl = document.getElementById('code-box');
     const refreshBtnEl = document.getElementById('refresh-btn');
-    let lastUpdatedAt = '';
 
     function renderStatus(whatsapp) {
       const text = (whatsapp.message || 'Sem status') + ' (' + (whatsapp.status || 'unknown') + ')';
@@ -135,15 +138,10 @@ function buildPairingPageHtml() {
         const whatsapp = data && data.whatsapp ? data.whatsapp : {};
         renderStatus(whatsapp);
 
-        if (whatsapp.qr) {
-          if (lastUpdatedAt !== whatsapp.updatedAt) {
-            lastUpdatedAt = whatsapp.updatedAt;
-            const url = '/pairing/qr?v=' + encodeURIComponent(whatsapp.updatedAt || Date.now());
-            qrBoxEl.innerHTML = '<img alt="QR Code WhatsApp" src="' + url + '" />';
-          }
+        if (whatsapp.pairingCode) {
+          codeBoxEl.innerHTML = '<span class="value mono">' + whatsapp.pairingCode + '</span>';
         } else {
-          lastUpdatedAt = '';
-          qrBoxEl.innerHTML = '<span>Nenhum QR disponível no momento.</span>';
+          codeBoxEl.innerHTML = '<span>Nenhum código disponível no momento.</span>';
         }
       } catch (error) {
         statusEl.textContent = 'Erro ao buscar status de pareamento.';
@@ -195,31 +193,9 @@ function createHttpApp() {
         status: escapeHtml(whatsapp.status),
         message: escapeHtml(whatsapp.message),
         updatedAt: whatsapp.updatedAt,
-        qr: whatsapp.qr
+        pairingCode: escapeHtml(whatsapp.pairingCode)
       }
     });
-  });
-
-  app.get('/pairing/qr', async (_req, res, next) => {
-    try {
-      const whatsapp = getWhatsAppState();
-
-      if (!whatsapp.qr) {
-        res.status(404).type('text/plain').send('QR indisponível no momento.');
-        return;
-      }
-
-      const svg = await QRCode.toString(whatsapp.qr, {
-        type: 'svg',
-        width: 320,
-        margin: 1
-      });
-
-      res.set('Cache-Control', 'no-store');
-      res.status(200).type('image/svg+xml').send(svg);
-    } catch (error) {
-      next(error);
-    }
   });
 
   app.use((error, req, res, next) => {
