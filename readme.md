@@ -46,6 +46,7 @@ Use em conversa privada com o bot:
 - `WHATSAPP_PAIRING_NUMBER`: número fixo para gerar código de pareamento (com DDI, só dígitos)
 - `REDIS_URL`: URL do Heroku Redis (injetada automaticamente pelo add-on)
 - `WHATSAPP_AUTH_PREFIX`: prefixo das chaves de sessão no Redis
+- `WHATSAPP_DATA_PREFIX`: prefixo das chaves de gastos no Redis
 - `REDIS_TLS`: habilita TLS no cliente Redis (`true` no Heroku)
 - `REDIS_TLS_REJECT_UNAUTHORIZED`: validação de certificado TLS (`false` para Heroku Redis self-signed)
 
@@ -57,6 +58,12 @@ Use em conversa privada com o bot:
 4. Digite o código mostrado na página.
 
 Com `REDIS_URL` ativo, a sessão do WhatsApp fica persistida e evita novo pareamento a cada deploy/restart.
+
+## 💾 Persistência dos Gastos
+
+- Com `REDIS_URL` configurado, os gastos são gravados no Redis (persistente no Heroku), não só no `data/transactions.json`.
+- Isso evita perda dos lançamentos em restart/redeploy do dyno.
+- Sem Redis, o bot cai em fallback para arquivo local, e esse arquivo pode ser perdido no ciclo de vida do dyno Heroku.
 
 ---
 
