@@ -1,5 +1,5 @@
-const path = require('path');
 const baileys = require('@whiskeysockets/baileys');
+const { loadWhatsAppAuthState } = require('./auth');
 const { parseTransactionWithAI } = require('./ai');
 const { getMonthlySummaryByUser, saveTransaction } = require('./storage');
 const {
@@ -23,9 +23,7 @@ const {
 } = require('./whatsappState');
 
 const makeWASocket = baileys.default;
-const { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = baileys;
-
-const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
+const { DisconnectReason, fetchLatestBaileysVersion } = baileys;
 const RECONNECT_DELAY_MS = 5000;
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 const MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_MESSAGES';
@@ -534,7 +532,7 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY_MS);
 }
 
-function createConnectionUpdateHandler(sock, state) {
+function createConnectionUpdateHandler(sock, state, authContext) {
   let pairingCodeRequested = false;
   let pairingHintLogged = false;
 
@@ -582,6 +580,10 @@ function createConnectionUpdateHandler(sock, state) {
       }
 
       if (connection === 'close') {
+        if (authContext && typeof authContext.close === 'function') {
+          await authContext.close();
+        }
+
         const statusCode = lastDisconnect &&
           lastDisconnect.error &&
           lastDisconnect.error.output
@@ -611,51 +613,61 @@ function createConnectionUpdateHandler(sock, state) {
 }
 
 async function createSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-
-  let version;
-
+  const authContext = await loadWhatsAppAuthState();
+  const { state, saveCreds } = authContext;
   try {
-    const latest = await fetchLatestBaileysVersion();
-    version = latest.version;
-  } catch (error) {
-    logWarn('WHATSAPP', 'Não foi possível buscar a versão mais recente do Baileys.');
-  }
+    let version;
 
-  const socketConfig = {
-    auth: state,
-    logger: silentBaileysLogger,
-    markOnlineOnConnect: false,
-    shouldIgnoreJid: (jid) => !isSupportedDirectChat(jid),
-    shouldSyncHistoryMessage: () => false,
-    syncFullHistory: false
-  };
-
-  if (version) {
-    socketConfig.version = version;
-  }
-
-  setWhatsAppConnecting();
-  const sock = makeWASocket(socketConfig);
-
-  sock.ev.on('creds.update', async () => {
     try {
-      await saveCreds();
+      const latest = await fetchLatestBaileysVersion();
+      version = latest.version;
     } catch (error) {
-      logError('WHATSAPP', 'Falha ao salvar credenciais.', error.message);
+      logWarn('WHATSAPP', 'Não foi possível buscar a versão mais recente do Baileys.');
     }
-  });
 
-  const handleConnectionUpdate = createConnectionUpdateHandler(sock, state);
+    const socketConfig = {
+      auth: state,
+      logger: silentBaileysLogger,
+      markOnlineOnConnect: false,
+      shouldIgnoreJid: (jid) => !isSupportedDirectChat(jid),
+      shouldSyncHistoryMessage: () => false,
+      syncFullHistory: false
+    };
 
-  sock.ev.on('connection.update', async (update) => {
-    await handleConnectionUpdate(update);
-  });
-  sock.ev.on('messages.upsert', async (event) => {
-    await handleMessagesUpsert(sock, event);
-  });
+    if (version) {
+      socketConfig.version = version;
+    }
 
-  return sock;
+    setWhatsAppConnecting();
+    const sock = makeWASocket(socketConfig);
+
+    sock.ev.on('creds.update', async () => {
+      try {
+        await saveCreds();
+      } catch (error) {
+        logError('WHATSAPP', 'Falha ao salvar credenciais.', error.message);
+      }
+    });
+
+    const handleConnectionUpdate = createConnectionUpdateHandler(sock, state, authContext);
+
+    sock.ev.on('connection.update', async (update) => {
+      await handleConnectionUpdate(update);
+    });
+    sock.ev.on('messages.upsert', async (event) => {
+      await handleMessagesUpsert(sock, event);
+    });
+
+    return sock;
+  } catch (error) {
+    try {
+      await authContext.close();
+    } catch (_closeError) {
+      // noop
+    }
+
+    throw error;
+  }
 }
 
 async function startWhatsAppBot() {

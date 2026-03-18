@@ -40,6 +40,22 @@ Use em conversa privada com o bot:
 - `resumo 03/2026`
 - `ajuda` (lista comandos)
 
+## ⚙️ Variáveis de Ambiente (Heroku)
+
+- `OPENAI_KEY`: chave da OpenAI
+- `WHATSAPP_PAIRING_NUMBER`: número fixo para gerar código de pareamento (com DDI, só dígitos)
+- `REDIS_URL`: URL do Heroku Redis (injetada automaticamente pelo add-on)
+- `WHATSAPP_AUTH_PREFIX`: prefixo das chaves de sessão no Redis
+
+## 🔐 Pareamento com Número Fixo
+
+1. Configure `WHATSAPP_PAIRING_NUMBER` com o número do bot (DDI + DDD + número, apenas dígitos).
+2. Acesse `/pairing` para ver o código de pareamento (sem QR).
+3. No celular do número do bot: `Dispositivos conectados` → `Conectar com número de telefone`.
+4. Digite o código mostrado na página.
+
+Com `REDIS_URL` ativo, a sessão do WhatsApp fica persistida e evita novo pareamento a cada deploy/restart.
+
 ---
 
 ## 🏗️ Arquitetura (MVP)
