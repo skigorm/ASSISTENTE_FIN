@@ -1,15 +1,47 @@
 const path = require('path');
-const baileys = require('@whiskeysockets/baileys');
 const { createClient } = require('redis');
 const { logError, logInfo, logWarn } = require('./utils');
-
-const { BufferJSON, initAuthCreds, proto, useMultiFileAuthState } = baileys;
 
 const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
 const REDIS_AUTH_PREFIX_ENV = 'WHATSAPP_AUTH_PREFIX';
 const DEFAULT_REDIS_AUTH_PREFIX = 'finance-bot:baileys-auth';
 const REDIS_TLS_ENV = 'REDIS_TLS';
 const REDIS_TLS_REJECT_UNAUTHORIZED_ENV = 'REDIS_TLS_REJECT_UNAUTHORIZED';
+let baileysRuntimePromise = null;
+
+async function getBaileysRuntime() {
+  if (!baileysRuntimePromise) {
+    baileysRuntimePromise = import('@whiskeysockets/baileys')
+      .then((moduleNs) => {
+        const runtime = moduleNs && typeof moduleNs === 'object' ? moduleNs : {};
+        const fallback = runtime.default && typeof runtime.default === 'object'
+          ? runtime.default
+          : {};
+
+        const BufferJSON = runtime.BufferJSON || fallback.BufferJSON;
+        const initAuthCreds = runtime.initAuthCreds || fallback.initAuthCreds;
+        const proto = runtime.proto || fallback.proto;
+        const useMultiFileAuthState = runtime.useMultiFileAuthState || fallback.useMultiFileAuthState;
+
+        if (!BufferJSON || !initAuthCreds || !proto || !useMultiFileAuthState) {
+          throw new Error('Baileys runtime incompleto para autenticação.');
+        }
+
+        return {
+          BufferJSON,
+          initAuthCreds,
+          proto,
+          useMultiFileAuthState
+        };
+      })
+      .catch((error) => {
+        baileysRuntimePromise = null;
+        throw error;
+      });
+  }
+
+  return baileysRuntimePromise;
+}
 
 function getRedisAuthPrefix() {
   const customPrefix = String(process.env[REDIS_AUTH_PREFIX_ENV] || '').trim();
@@ -36,10 +68,16 @@ function buildRedisKey(prefix, name) {
   return `${prefix}:${fixKeyName(name)}`;
 }
 
-async function useRedisAuthState(redisUrl, prefix) {
-  const useTls = isEnvEnabled(REDIS_TLS_ENV, redisUrl.startsWith('rediss://'));
-  const tlsRejectUnauthorized = isEnvEnabled(REDIS_TLS_REJECT_UNAUTHORIZED_ENV, false);
-  let errorAlreadyLogged = false;
+async function useRedisAuthState(redisUrl, prefix, options = {}) {
+  const { BufferJSON, initAuthCreds, proto } = await getBaileysRuntime();
+  const useTls = typeof options.useTls === 'boolean'
+    ? options.useTls
+    : isEnvEnabled(REDIS_TLS_ENV, redisUrl.startsWith('rediss://'));
+  const tlsRejectUnauthorized = typeof options.tlsRejectUnauthorized === 'boolean'
+    ? options.tlsRejectUnauthorized
+    : isEnvEnabled(REDIS_TLS_REJECT_UNAUTHORIZED_ENV, false);
+  const allowRetry = options.allowRetry !== false;
+  let lastErrorLogAt = 0;
 
   const client = createClient({
     url: redisUrl,
@@ -58,13 +96,39 @@ async function useRedisAuthState(redisUrl, prefix) {
   });
 
   client.on('error', (error) => {
-    if (!errorAlreadyLogged) {
-      errorAlreadyLogged = true;
+    if (Date.now() - lastErrorLogAt > 30000) {
+      lastErrorLogAt = Date.now();
       logError('AUTH', 'Erro no cliente Redis de autenticação.', error.message);
     }
   });
 
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (error) {
+    try {
+      client.disconnect();
+    } catch (_disconnectError) {
+      // noop
+    }
+
+    const message = error && error.message ? String(error.message) : String(error);
+    const selfSignedTlsError = /self[- ]signed certificate/i.test(message);
+
+    if (useTls && tlsRejectUnauthorized && selfSignedTlsError && allowRetry) {
+      logWarn(
+        'AUTH',
+        'Falha TLS no Redis de autenticação. Tentando novamente com REDIS_TLS_REJECT_UNAUTHORIZED=false.'
+      );
+
+      return useRedisAuthState(redisUrl, prefix, {
+        useTls: true,
+        tlsRejectUnauthorized: false,
+        allowRetry: false
+      });
+    }
+
+    throw error;
+  }
 
   const readData = async (name) => {
     try {
@@ -158,6 +222,7 @@ async function useRedisAuthState(redisUrl, prefix) {
 }
 
 async function loadWhatsAppAuthState() {
+  const { useMultiFileAuthState } = await getBaileysRuntime();
   const redisUrl = String(process.env.REDIS_URL || '').trim();
 
   if (redisUrl) {

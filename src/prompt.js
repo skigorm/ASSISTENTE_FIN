@@ -15,6 +15,25 @@ function buildExtractionSystemPrompt(referenceDate) {
   ].join('\n');
 }
 
+function buildUpdateSystemPrompt(referenceDate) {
+  return [
+    'Você extrai possíveis alterações de um gasto financeiro a partir de texto informal em português.',
+    'Responda apenas com JSON válido, sem markdown, sem texto adicional e sem comentários.',
+    'Formato obrigatório de saída:',
+    '{"valor": number|null, "categoria": "Alimentação|Transporte|Lazer|Outros"|null, "descricao": "string|null", "data": "YYYY-MM-DD|null"}',
+    'Regras obrigatórias:',
+    '1) Retorne null para campos não informados claramente.',
+    '2) valor deve ser número positivo quando presente.',
+    '3) categoria deve ser exatamente uma das opções quando presente.',
+    '4) descricao deve ser curta e objetiva quando presente.',
+    '5) data deve estar em YYYY-MM-DD quando presente.',
+    `6) Considere a data de referência como ${referenceDate}. Interprete hoje/ontem/anteontem.`,
+    '7) Nunca inclua chaves extras.',
+    '8) Nunca retorne texto fora do JSON.'
+  ].join('\n');
+}
+
 module.exports = {
-  buildExtractionSystemPrompt
+  buildExtractionSystemPrompt,
+  buildUpdateSystemPrompt
 };

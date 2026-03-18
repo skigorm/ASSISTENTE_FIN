@@ -1,11 +1,14 @@
 const axios = require('axios');
-const { buildExtractionSystemPrompt } = require('./prompt');
+const { buildExtractionSystemPrompt, buildUpdateSystemPrompt } = require('./prompt');
 const {
   extractJSONObject,
   logError,
   logInfo,
   logWarn,
+  normalizeCategory,
+  normalizeDate,
   normalizeTransaction,
+  parseMoney,
   safeJsonParse,
   sanitizeText,
   toISODate
@@ -32,19 +35,12 @@ function parseModelOutput(content) {
   return extracted ? safeJsonParse(extracted) : null;
 }
 
-async function parseTransactionWithAI(text, referenceDate = new Date()) {
-  const cleanText = sanitizeText(text);
-
-  if (!cleanText) {
-    return null;
-  }
-
+async function callOpenAIJson(messages) {
   if (!process.env.OPENAI_KEY) {
     logWarn('AI', 'OPENAI_KEY não configurada. Usando fallback local.');
     return null;
   }
 
-  const referenceDateISO = toISODate(referenceDate);
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
   try {
@@ -54,16 +50,7 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
         model,
         temperature: 0,
         response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'system',
-            content: buildExtractionSystemPrompt(referenceDateISO)
-          },
-          {
-            role: 'user',
-            content: cleanText
-          }
-        ]
+        messages
       },
       {
         headers: {
@@ -85,15 +72,7 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
       return null;
     }
 
-    const normalized = normalizeTransaction(parsed, referenceDate);
-
-    if (!normalized.valid) {
-      logWarn('AI', 'JSON da OpenAI inválido após normalização.', normalized.errors);
-      return null;
-    }
-
-    logInfo('AI', 'Mensagem interpretada com sucesso pela OpenAI.');
-    return normalized.data;
+    return parsed;
   } catch (error) {
     const status = error && error.response ? error.response.status : undefined;
     const apiError = error && error.response && error.response.data
@@ -108,6 +87,93 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
   }
 }
 
+async function parseTransactionWithAI(text, referenceDate = new Date()) {
+  const cleanText = sanitizeText(text);
+
+  if (!cleanText) {
+    return null;
+  }
+
+  const referenceDateISO = toISODate(referenceDate);
+  const parsed = await callOpenAIJson([
+    {
+      role: 'system',
+      content: buildExtractionSystemPrompt(referenceDateISO)
+    },
+    {
+      role: 'user',
+      content: cleanText
+    }
+  ]);
+
+  if (!parsed) {
+    return null;
+  }
+
+  const normalized = normalizeTransaction(parsed, referenceDate);
+
+  if (!normalized.valid) {
+    logWarn('AI', 'JSON da OpenAI inválido após normalização.', normalized.errors);
+    return null;
+  }
+
+  logInfo('AI', 'Mensagem interpretada com sucesso pela OpenAI.');
+  return normalized.data;
+}
+
+async function parseTransactionPatchWithAI(text, referenceDate = new Date()) {
+  const cleanText = sanitizeText(text);
+
+  if (!cleanText) {
+    return null;
+  }
+
+  const referenceDateISO = toISODate(referenceDate);
+  const parsed = await callOpenAIJson([
+    {
+      role: 'system',
+      content: buildUpdateSystemPrompt(referenceDateISO)
+    },
+    {
+      role: 'user',
+      content: cleanText
+    }
+  ]);
+
+  if (!parsed || typeof parsed !== 'object') {
+    return null;
+  }
+
+  const patch = {};
+  const maybeValue = parsed.valor;
+  const maybeCategory = parsed.categoria;
+  const maybeDescription = parsed.descricao;
+  const maybeDate = parsed.data;
+
+  if (maybeValue !== null && maybeValue !== undefined && sanitizeText(String(maybeValue))) {
+    const parsedValue = parseMoney(maybeValue);
+
+    if (Number.isFinite(parsedValue) && parsedValue > 0) {
+      patch.valor = Number(parsedValue.toFixed(2));
+    }
+  }
+
+  if (maybeCategory !== null && maybeCategory !== undefined && sanitizeText(String(maybeCategory))) {
+    patch.categoria = normalizeCategory(maybeCategory);
+  }
+
+  if (maybeDescription !== null && maybeDescription !== undefined && sanitizeText(String(maybeDescription))) {
+    patch.descricao = sanitizeText(String(maybeDescription));
+  }
+
+  if (maybeDate !== null && maybeDate !== undefined && sanitizeText(String(maybeDate))) {
+    patch.data = normalizeDate(String(maybeDate), referenceDate);
+  }
+
+  return Object.keys(patch).length ? patch : null;
+}
+
 module.exports = {
+  parseTransactionPatchWithAI,
   parseTransactionWithAI
 };

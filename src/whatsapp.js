@@ -1,7 +1,18 @@
-const baileys = require('@whiskeysockets/baileys');
 const { loadWhatsAppAuthState } = require('./auth');
-const { parseTransactionWithAI } = require('./ai');
-const { getMonthlySummaryByUser, saveTransaction } = require('./storage');
+const { parseTransactionPatchWithAI, parseTransactionWithAI } = require('./ai');
+const {
+  DEFAULT_ALERT_THRESHOLDS,
+  clearConversationState,
+  deleteTransactionById,
+  getConversationState,
+  getMonthlySummaryByUser,
+  getRecentTransactionsByUser,
+  getUserProfile,
+  saveTransaction,
+  setConversationState,
+  updateTransactionById,
+  updateUserProfile
+} = require('./storage');
 const {
   ALLOWED_CATEGORIES,
   fallbackParseTransaction,
@@ -11,6 +22,8 @@ const {
   logInfo,
   logWarn,
   normalizeUserId,
+  parseDateFromText,
+  parseMoney,
   sanitizeText
 } = require('./utils');
 const {
@@ -22,9 +35,9 @@ const {
   setWhatsAppWaitingQr
 } = require('./whatsappState');
 
-const makeWASocket = baileys.default;
-const { DisconnectReason, fetchLatestBaileysVersion } = baileys;
 const RECONNECT_DELAY_MS = 5000;
+const CONVERSATION_STATE_TTL_SECONDS = 24 * 60 * 60;
+
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 const MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_MESSAGES';
 const IGNORED_MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_IGNORED_MESSAGES';
@@ -44,6 +57,45 @@ const silentBaileysLogger = {
 let activeSocket = null;
 let isStarting = false;
 let reconnectTimer = null;
+let baileysRuntimePromise = null;
+
+async function getBaileysRuntime() {
+  if (!baileysRuntimePromise) {
+    baileysRuntimePromise = import('@whiskeysockets/baileys')
+      .then((moduleNs) => {
+        const runtime = moduleNs && typeof moduleNs === 'object' ? moduleNs : {};
+        const fallback = runtime.default && typeof runtime.default === 'object'
+          ? runtime.default
+          : {};
+
+        const makeWASocket = typeof runtime.default === 'function'
+          ? runtime.default
+          : typeof runtime.makeWASocket === 'function'
+            ? runtime.makeWASocket
+            : typeof fallback.makeWASocket === 'function'
+              ? fallback.makeWASocket
+              : null;
+        const DisconnectReason = runtime.DisconnectReason || fallback.DisconnectReason || {};
+        const fetchLatestBaileysVersion = runtime.fetchLatestBaileysVersion || fallback.fetchLatestBaileysVersion;
+
+        if (typeof makeWASocket !== 'function') {
+          throw new Error('Baileys runtime inválido: makeWASocket não encontrado.');
+        }
+
+        return {
+          makeWASocket,
+          DisconnectReason,
+          fetchLatestBaileysVersion
+        };
+      })
+      .catch((error) => {
+        baileysRuntimePromise = null;
+        throw error;
+      });
+  }
+
+  return baileysRuntimePromise;
+}
 
 function isEnvEnabled(name, defaultValue = false) {
   const value = String(process.env[name] || '').trim().toLowerCase();
@@ -76,6 +128,93 @@ function formatPairingCode(rawCode) {
 
   const chunks = code.match(/.{1,4}/g);
   return chunks ? chunks.join('-') : code;
+}
+
+function stripAccents(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function normalizeCommandText(text) {
+  return stripAccents(sanitizeText(text).toLowerCase());
+}
+
+function parseYesNo(text) {
+  const normalized = normalizeCommandText(text);
+
+  if (/^(sim|s|yes|y|quero|claro|ok|pode)\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/^(nao|n|no|na)\b/.test(normalized)) {
+    return false;
+  }
+
+  return null;
+}
+
+function isSkipKeyword(text) {
+  const normalized = normalizeCommandText(text);
+  return /\b(pular|ignorar|deixa|nao quero|sem)\b/.test(normalized);
+}
+
+function formatDateBR(isoDate) {
+  const safeDate = sanitizeText(isoDate);
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(safeDate)) {
+    return safeDate;
+  }
+
+  const [year, month, day] = safeDate.split('-');
+  return `${day}/${month}/${year}`;
+}
+
+function monthLabelFromYearMonth(year, month) {
+  return `${String(month).padStart(2, '0')}/${year}`;
+}
+
+function monthLabelFromIsoDate(isoDate) {
+  const safeDate = sanitizeText(isoDate);
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(safeDate)) {
+    const now = new Date();
+    return monthLabelFromYearMonth(now.getFullYear(), now.getMonth() + 1);
+  }
+
+  return `${safeDate.slice(5, 7)}/${safeDate.slice(0, 4)}`;
+}
+
+function parseCategoryFromText(commandText) {
+  if (/\b(alimentacao|mercado|ifood|comida|restaurante|lanche)\b/.test(commandText)) {
+    return 'Alimentação';
+  }
+
+  if (/\b(transporte|uber|taxi|onibus|metro|combustivel|gasolina|passagem)\b/.test(commandText)) {
+    return 'Transporte';
+  }
+
+  if (/\b(lazer|entretenimento|cinema|bar|show|netflix|spotify|viagem)\b/.test(commandText)) {
+    return 'Lazer';
+  }
+
+  if (/\b(outros?)\b/.test(commandText)) {
+    return 'Outros';
+  }
+
+  return null;
+}
+
+function parseTransactionIdFromText(text) {
+  const safeText = sanitizeText(text);
+  const idMatch = safeText.match(/\b((?:tx|legacy)[-_][a-z0-9]{6,})\b/i);
+
+  if (idMatch) {
+    return sanitizeText(idMatch[1]);
+  }
+
+  const generic = safeText.match(/\bid\s*[:#-]?\s*([a-z0-9_-]{8,})\b/i);
+  return generic ? sanitizeText(generic[1]) : null;
 }
 
 function unwrapMessageContent(messageContent) {
@@ -146,70 +285,150 @@ async function safeReply(sock, jid, text) {
   }
 }
 
-function buildSuccessMessage(transaction) {
+function buildHelpMessage() {
   return [
-    '💰 Gasto registrado:',
-    `Valor: ${formatCurrencyBRL(transaction.valor)}`,
-    `Categoria: ${transaction.categoria}`
+    'Comandos disponíveis:',
+    '- resumo do mes',
+    '- total por categoria',
+    '- total alimentação no mes',
+    '- resumo 03/2026',
+    '- como estao minhas contas',
+    '- orçamento do mes',
+    '- saldo do mes',
+    '- listar gastos',
+    '- listar gastos 20',
+    '- remover gasto <id> | remover ultimo gasto',
+    '- editar gasto <id> para 45 no mercado ontem',
+    '- desfazer ultimo gasto',
+    '- meu perfil',
+    '- nome <seu nome>',
+    '- renda 5500',
+    '- orçamento alimentação 1200',
+    '- limpar orçamento alimentação',
+    '- alertas 10 20 30',
+    '',
+    'Para registrar gasto, envie uma mensagem natural, ex:',
+    'gastei 45 no mercado',
+    'paguei 39 no uber hoje'
   ].join('\n');
 }
 
-function stripAccents(text) {
-  return String(text || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
+function formatSignedCurrency(value) {
+  const safeValue = Number(value);
+
+  if (!Number.isFinite(safeValue)) {
+    return formatCurrencyBRL(0);
+  }
+
+  if (safeValue > 0) {
+    return `+${formatCurrencyBRL(safeValue)}`;
+  }
+
+  return `-${formatCurrencyBRL(Math.abs(safeValue))}`;
 }
 
-function normalizeCommandText(text) {
-  return stripAccents(sanitizeText(text).toLowerCase());
+function buildBudgetProgressLines(profile, monthSummary) {
+  if (!profile || !profile.budgetByCategory) {
+    return [];
+  }
+
+  const lines = [];
+
+  for (const category of ALLOWED_CATEGORIES) {
+    const budget = Number(profile.budgetByCategory[category]);
+
+    if (!Number.isFinite(budget) || budget <= 0) {
+      continue;
+    }
+
+    const spent = Number(monthSummary.byCategory[category] || 0);
+    const remaining = budget - spent;
+    const remainingPercent = budget > 0 ? Math.max(0, (remaining / budget) * 100) : 0;
+
+    lines.push(
+      `- ${category}: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budget)} (restante ${Math.round(remainingPercent)}%)`
+    );
+  }
+
+  return lines;
 }
 
-function isHelpCommand(commandText) {
-  return /^(\/)?(ajuda|comandos?)\b/.test(commandText);
+function buildMonthlySummaryMessage(summary, monthLabel, profile) {
+  if (!summary.count) {
+    return `📊 Nenhum gasto encontrado em ${monthLabel}.`;
+  }
+
+  const lines = [
+    `📊 Resumo de ${monthLabel}:`,
+    `Total: ${formatCurrencyBRL(summary.total)}`,
+    `Lançamentos: ${summary.count}`,
+    '',
+    'Por categoria:'
+  ];
+
+  for (const category of ALLOWED_CATEGORIES) {
+    lines.push(`- ${category}: ${formatCurrencyBRL(summary.byCategory[category] || 0)}`);
+  }
+
+  const monthlyIncome = profile ? Number(profile.monthlyIncome) : Number.NaN;
+
+  if (Number.isFinite(monthlyIncome) && monthlyIncome > 0) {
+    const balance = monthlyIncome - Number(summary.total || 0);
+
+    lines.push('');
+    lines.push(`Renda mensal: ${formatCurrencyBRL(monthlyIncome)}`);
+    lines.push(`Saldo estimado no mês: ${formatSignedCurrency(balance)}`);
+  }
+
+  const budgetLines = buildBudgetProgressLines(profile, summary);
+
+  if (budgetLines.length) {
+    lines.push('');
+    lines.push('Orçamentos no mês:');
+    lines.push(...budgetLines);
+  }
+
+  return lines.join('\n');
 }
 
-function hasMonthlySummaryIntent(commandText) {
-  if (/^\/?(resumo|relatorio)\b/.test(commandText)) {
-    return true;
+function buildCategorySummaryMessage(category, monthLabel, categoryTotal, categoryCount) {
+  if (!categoryCount) {
+    return `📊 Nenhum gasto de ${category.toLowerCase()} encontrado em ${monthLabel}.`;
   }
 
-  if (/quanto\s+gastei/.test(commandText)) {
-    return true;
-  }
-
-  if (/(total|gastos?)\s+(do|no|nesse|neste)?\s*mes/.test(commandText)) {
-    return true;
-  }
-
-  if (/por\s+categoria/.test(commandText)) {
-    return true;
-  }
-
-  if (/^\/?total\s+(alimentacao|transporte|lazer|outros)\b/.test(commandText)) {
-    return true;
-  }
-
-  return false;
+  return [
+    `📊 ${category} em ${monthLabel}:`,
+    `Total: ${formatCurrencyBRL(categoryTotal)}`,
+    `Lançamentos: ${categoryCount}`
+  ].join('\n');
 }
 
-function extractRequestedCategory(commandText) {
-  if (/\b(alimentacao|mercado|ifood|comida|restaurante|lanche)\b/.test(commandText)) {
-    return 'Alimentação';
+function buildBudgetStatusMessage(profile, summary, monthLabel) {
+  const lines = [`💼 Situação financeira de ${monthLabel}:`];
+
+  const monthlyIncome = profile ? Number(profile.monthlyIncome) : Number.NaN;
+
+  lines.push(`- Total gasto: ${formatCurrencyBRL(summary.total)}`);
+
+  if (Number.isFinite(monthlyIncome) && monthlyIncome > 0) {
+    const balance = monthlyIncome - Number(summary.total || 0);
+    lines.push(`- Renda mensal: ${formatCurrencyBRL(monthlyIncome)}`);
+    lines.push(`- Saldo estimado: ${formatSignedCurrency(balance)}`);
   }
 
-  if (/\b(transporte|uber|taxi|onibus|metro|combustivel|gasolina|passagem)\b/.test(commandText)) {
-    return 'Transporte';
+  const budgetLines = buildBudgetProgressLines(profile, summary);
+
+  if (budgetLines.length) {
+    lines.push('');
+    lines.push('Orçamentos por categoria:');
+    lines.push(...budgetLines);
+  } else {
+    lines.push('');
+    lines.push('Você ainda não definiu orçamento por categoria.');
+    lines.push('Exemplo: orçamento alimentação 1200');
   }
 
-  if (/\b(lazer|entretenimento|cinema|bar|show|netflix|spotify|viagem)\b/.test(commandText)) {
-    return 'Lazer';
-  }
-
-  if (/\b(outros?)\b/.test(commandText)) {
-    return 'Outros';
-  }
-
-  return null;
+  return lines.join('\n');
 }
 
 function resolveSummaryMonth(commandText, referenceDate = new Date()) {
@@ -223,7 +442,7 @@ function resolveSummaryMonth(commandText, referenceDate = new Date()) {
     return {
       year,
       month,
-      label: `${String(month).padStart(2, '0')}/${year}`
+      label: monthLabelFromYearMonth(year, month)
     };
   }
 
@@ -266,69 +485,722 @@ function resolveSummaryMonth(commandText, referenceDate = new Date()) {
   return {
     year,
     month,
-    label: `${String(month).padStart(2, '0')}/${year}`
+    label: monthLabelFromYearMonth(year, month)
   };
 }
 
-function buildMonthlySummaryMessage(summary, monthLabel) {
-  if (!summary.count) {
-    return `📊 Nenhum gasto encontrado em ${monthLabel}.`;
+function hasMonthlySummaryIntent(commandText) {
+  if (/^\/?(resumo|relatorio)\b/.test(commandText)) {
+    return true;
   }
 
-  const lines = [
-    `📊 Resumo de ${monthLabel}:`,
-    `Total: ${formatCurrencyBRL(summary.total)}`,
-    `Lançamentos: ${summary.count}`,
+  if (/quanto\s+gastei/.test(commandText)) {
+    return true;
+  }
+
+  if (/(total|gastos?)\s+(do|no|nesse|neste)?\s*mes/.test(commandText)) {
+    return true;
+  }
+
+  if (/por\s+categoria/.test(commandText)) {
+    return true;
+  }
+
+  if (/^\/?total\s+(alimentacao|transporte|lazer|outros)\b/.test(commandText)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasBudgetStatusIntent(commandText) {
+  if (/^(\/)?(orcamento|orçamento)(\s+do\s+mes)?$/.test(commandText)) {
+    return true;
+  }
+
+  if (/^(\/)?(saldo(\s+do\s+mes)?|como\s+esta\s+minha\s+conta|como\s+estao\s+minhas\s+contas|como\s+estao\s+as\s+contas)$/.test(commandText)) {
+    return true;
+  }
+
+  if (/(quanto\s+resta|quanto\s+sobrou|restante\s+do\s+mes)/.test(commandText)) {
+    return true;
+  }
+
+  return false;
+}
+
+function shouldListExpenses(commandText) {
+  return (
+    /(listar|lista|mostrar|ultimos|ultimas|recentes)\s+(gastos|despesas|lancamentos|lan[cç]amentos)/.test(commandText) ||
+    /(gastos|despesas)\s+recentes/.test(commandText)
+  );
+}
+
+function parseListLimit(text) {
+  const commandText = normalizeCommandText(text);
+  const match = commandText.match(/\b(?:listar|lista|mostrar)\b.*\b(?:gastos|despesas|lancamentos|lan[cç]amentos)\b.*\b(\d{1,2})\b/);
+
+  if (!match || !match[1]) {
+    return 10;
+  }
+
+  const parsed = Number.parseInt(match[1], 10);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return 10;
+  }
+
+  return Math.min(parsed, 50);
+}
+
+function parseDeleteIntent(text) {
+  const commandText = normalizeCommandText(text);
+
+  if (/\bdesfazer\b/.test(commandText) && /\b(gasto|despesa|lancamento|lan[cç]amento)\b/.test(commandText)) {
+    return { target: 'last' };
+  }
+
+  if (!/(remover|apagar|excluir|deletar)/.test(commandText)) {
+    return null;
+  }
+
+  if (/\b(ultimo|ultima|último|última)\b/.test(commandText)) {
+    return { target: 'last' };
+  }
+
+  const id = parseTransactionIdFromText(text);
+
+  if (id) {
+    return { target: 'id', transactionId: id };
+  }
+
+  return { target: 'last_auto' };
+}
+
+function parseEditIntent(text) {
+  const commandText = normalizeCommandText(text);
+
+  if (!/(editar|corrigir|retificar|ajustar)/.test(commandText)) {
+    return null;
+  }
+
+  const targetLast = /\b(ultimo|ultima|último|última)\b/.test(commandText);
+  const transactionId = targetLast ? null : parseTransactionIdFromText(text);
+
+  const paraMatch = text.match(/\bpara\b/i);
+  let updateText = text;
+
+  if (paraMatch && Number.isInteger(paraMatch.index)) {
+    updateText = text.slice(paraMatch.index + paraMatch[0].length);
+  }
+
+  return {
+    target: targetLast ? 'last' : transactionId ? 'id' : 'last_auto',
+    transactionId,
+    updateText: sanitizeText(updateText)
+  };
+}
+
+function parsePatchFromTextFallback(text, referenceDate = new Date()) {
+  const clean = sanitizeText(text);
+
+  if (!clean) {
+    return null;
+  }
+
+  const patch = {};
+  const normalized = normalizeCommandText(clean);
+
+  const valueMatch = clean.match(/(?:valor|r\$)\s*[:=\-]?\s*(\d+[\d.,]*)/i) || clean.match(/\b(\d+[\d.,]*)\b/);
+
+  if (valueMatch && valueMatch[1]) {
+    const value = parseMoney(valueMatch[1]);
+
+    if (Number.isFinite(value) && value > 0) {
+      patch.valor = Number(value.toFixed(2));
+    }
+  }
+
+  const category = parseCategoryFromText(normalized);
+
+  if (category) {
+    patch.categoria = category;
+  }
+
+  if (/\b(hoje|ontem|anteontem|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|\d{4}-\d{2}-\d{2})\b/i.test(clean)) {
+    patch.data = parseDateFromText(clean, referenceDate);
+  }
+
+  const descriptionMatch = clean.match(/(?:descricao|descrição|desc)\s*[:=\-]?\s*(.+)$/i);
+
+  if (descriptionMatch && descriptionMatch[1]) {
+    patch.descricao = sanitizeText(descriptionMatch[1]);
+  }
+
+  return Object.keys(patch).length ? patch : null;
+}
+
+function buildProfileMessage(profile) {
+  const nameLine = profile.name ? `Nome: ${profile.name}` : 'Nome: não informado';
+  const incomeLine = Number.isFinite(Number(profile.monthlyIncome)) && Number(profile.monthlyIncome) > 0
+    ? `Renda mensal: ${formatCurrencyBRL(Number(profile.monthlyIncome))}`
+    : 'Renda mensal: não informada';
+
+  const budgetLines = ALLOWED_CATEGORIES.map((category) => {
+    const value = profile.budgetByCategory && Number(profile.budgetByCategory[category]);
+
+    if (Number.isFinite(value) && value > 0) {
+      return `- ${category}: ${formatCurrencyBRL(value)}`;
+    }
+
+    return `- ${category}: não definido`;
+  });
+
+  const alertThresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
+    ? profile.alertThresholds.join('% / ') + '%'
+    : DEFAULT_ALERT_THRESHOLDS.join('% / ') + '%';
+
+  return [
+    '👤 Seu perfil financeiro:',
+    nameLine,
+    incomeLine,
+    `Alertas de orçamento (saldo restante): ${alertThresholds}`,
     '',
-    'Por categoria:'
-  ];
+    'Orçamento por categoria:',
+    ...budgetLines
+  ].join('\n');
+}
 
-  for (const category of ALLOWED_CATEGORIES) {
-    lines.push(`- ${category}: ${formatCurrencyBRL(summary.byCategory[category] || 0)}`);
+function buildRecentExpensesMessage(list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    return 'Ainda não encontrei gastos para mostrar.';
   }
+
+  const lines = ['🧾 Seus gastos mais recentes:'];
+
+  for (const item of list) {
+    lines.push(
+      `- ${item.id} | ${formatDateBR(item.data)} | ${item.categoria} | ${formatCurrencyBRL(item.valor)} | ${sanitizeText(item.descricao)}`
+    );
+  }
+
+  lines.push('');
+  lines.push('Para editar/remover:');
+  lines.push('- editar gasto <id> para 45 no mercado');
+  lines.push('- remover gasto <id>');
 
   return lines.join('\n');
 }
 
-function buildCategorySummaryMessage(category, monthLabel, categoryTotal, categoryCount) {
-  if (!categoryCount) {
-    return `📊 Nenhum gasto de ${category.toLowerCase()} encontrado em ${monthLabel}.`;
+function buildOnboardingSummary(profile) {
+  const thresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
+    ? profile.alertThresholds.join('% / ') + '%'
+    : DEFAULT_ALERT_THRESHOLDS.join('% / ') + '%';
+  const lines = [
+    '✅ Cadastro concluído!',
+    profile.name ? `Prazer, ${profile.name}!` : 'Prazer em te ajudar!',
+    Number(profile.monthlyIncome) > 0
+      ? `Renda mensal registrada: ${formatCurrencyBRL(Number(profile.monthlyIncome))}`
+      : 'Renda mensal: não informada.'
+  ];
+
+  const hasAnyBudget = ALLOWED_CATEGORIES.some((category) => Number(profile.budgetByCategory[category]) > 0);
+
+  if (hasAnyBudget) {
+    lines.push('Orçamentos por categoria:');
+
+    for (const category of ALLOWED_CATEGORIES) {
+      const value = Number(profile.budgetByCategory[category]);
+
+      if (Number.isFinite(value) && value > 0) {
+        lines.push(`- ${category}: ${formatCurrencyBRL(value)}`);
+      }
+    }
+  } else {
+    lines.push('Você ainda não definiu orçamento por categoria.');
   }
 
-  return [
-    `📊 ${category} em ${monthLabel}:`,
-    `Total: ${formatCurrencyBRL(categoryTotal)}`,
-    `Lançamentos: ${categoryCount}`
-  ].join('\n');
+  lines.push(`Alertas de orçamento (saldo restante): ${thresholds}`);
+
+  lines.push('');
+  lines.push('Agora você já pode mandar gastos normalmente.');
+  lines.push('Exemplo: gastei 42 no mercado');
+
+  return lines.join('\n');
 }
 
-function buildHelpMessage() {
-  return [
-    'Comandos disponíveis:',
-    '- resumo do mes',
-    '- total do mes',
-    '- total por categoria',
-    '- total alimentação no mes',
-    '- resumo 03/2026',
-    '',
-    'Para registrar gasto, continue enviando mensagens normais, ex:',
-    'gastei 45 no mercado'
-  ].join('\n');
+async function startOnboarding(sock, jid, userNumber) {
+  await setConversationState(
+    userNumber,
+    {
+      step: 'onboarding_ask_name',
+      data: {}
+    },
+    CONVERSATION_STATE_TTL_SECONDS
+  );
+
+  await safeReply(
+    sock,
+    jid,
+    [
+      '👋 Bem-vindo ao seu assistente financeiro!',
+      'Antes de começar, como você prefere ser chamado?'
+    ].join('\n')
+  );
 }
 
-async function tryHandleFinanceCommand(sock, jid, userNumber, text, referenceDate) {
+async function finalizeOnboarding(sock, jid, userNumber) {
+  const profile = await updateUserProfile(userNumber, {
+    onboardingComplete: true
+  });
+
+  await clearConversationState(userNumber);
+  await safeReply(sock, jid, buildOnboardingSummary(profile));
+
+  return profile;
+}
+
+async function handleOnboardingFlow(sock, jid, userNumber, text, profile, conversationState) {
+  if (profile && profile.onboardingComplete) {
+    return { handled: false, profile };
+  }
+
   const commandText = normalizeCommandText(text);
 
-  if (isHelpCommand(commandText)) {
-    await safeReply(sock, jid, buildHelpMessage());
+  if (/\b(pular cadastro|pular onboarding|cancelar cadastro)\b/.test(commandText)) {
+    const updated = await finalizeOnboarding(sock, jid, userNumber);
+    return { handled: true, profile: updated };
+  }
+
+  const state = conversationState && /^onboarding_/.test(String(conversationState.step || ''))
+    ? conversationState
+    : null;
+
+  if (!state) {
+    await startOnboarding(sock, jid, userNumber);
+    return { handled: true, profile };
+  }
+
+  if (state.step === 'onboarding_ask_name') {
+    const maybeName = sanitizeText(text).replace(/^(meu nome e|me chamo|sou)\s+/i, '').trim();
+
+    if (!maybeName || maybeName.length < 2) {
+      await safeReply(sock, jid, 'Não entendi seu nome. Me diga como você prefere ser chamado.');
+      return { handled: true, profile };
+    }
+
+    const updated = await updateUserProfile(userNumber, {
+      name: maybeName
+    });
+
+    await setConversationState(
+      userNumber,
+      {
+        step: 'onboarding_ask_income_opt',
+        data: {}
+      },
+      CONVERSATION_STATE_TTL_SECONDS
+    );
+
+    await safeReply(
+      sock,
+      jid,
+      `Perfeito, ${updated.name}! Você quer informar sua renda mensal para acompanhar melhor suas contas? (sim/não)`
+    );
+
+    return { handled: true, profile: updated };
+  }
+
+  if (state.step === 'onboarding_ask_income_opt') {
+    const yesNo = parseYesNo(text);
+
+    if (yesNo === null) {
+      await safeReply(sock, jid, 'Responde com *sim* ou *não*, por favor.');
+      return { handled: true, profile };
+    }
+
+    if (yesNo) {
+      await setConversationState(
+        userNumber,
+        {
+          step: 'onboarding_ask_income_value',
+          data: {}
+        },
+        CONVERSATION_STATE_TTL_SECONDS
+      );
+
+      await safeReply(sock, jid, 'Qual é sua renda mensal aproximada? Exemplo: 5500');
+      return { handled: true, profile };
+    }
+
+    const updated = await updateUserProfile(userNumber, {
+      monthlyIncome: null
+    });
+
+    await setConversationState(
+      userNumber,
+      {
+        step: 'onboarding_ask_budget_opt',
+        data: {}
+      },
+      CONVERSATION_STATE_TTL_SECONDS
+    );
+
+    await safeReply(sock, jid, 'Quer definir orçamento mensal por categoria agora? (sim/não)');
+    return { handled: true, profile: updated };
+  }
+
+  if (state.step === 'onboarding_ask_income_value') {
+    const income = parseMoney(text);
+
+    if (!Number.isFinite(income) || income <= 0) {
+      await safeReply(sock, jid, 'Não consegui ler esse valor. Me manda apenas número, ex: 5500');
+      return { handled: true, profile };
+    }
+
+    const updated = await updateUserProfile(userNumber, {
+      monthlyIncome: Number(income.toFixed(2))
+    });
+
+    await setConversationState(
+      userNumber,
+      {
+        step: 'onboarding_ask_budget_opt',
+        data: {}
+      },
+      CONVERSATION_STATE_TTL_SECONDS
+    );
+
+    await safeReply(sock, jid, 'Ótimo! Quer definir orçamento mensal por categoria agora? (sim/não)');
+    return { handled: true, profile: updated };
+  }
+
+  if (state.step === 'onboarding_ask_budget_opt') {
+    const yesNo = parseYesNo(text);
+
+    if (yesNo === null) {
+      await safeReply(sock, jid, 'Responde com *sim* ou *não*, por favor.');
+      return { handled: true, profile };
+    }
+
+    if (!yesNo) {
+      const updated = await finalizeOnboarding(sock, jid, userNumber);
+      return { handled: true, profile: updated };
+    }
+
+    await setConversationState(
+      userNumber,
+      {
+        step: 'onboarding_ask_budget_category',
+        data: { categoryIndex: 0 }
+      },
+      CONVERSATION_STATE_TTL_SECONDS
+    );
+
+    await safeReply(
+      sock,
+      jid,
+      `Quanto é seu orçamento mensal para *${ALLOWED_CATEGORIES[0]}*? (envie número ou "pular")`
+    );
+
+    return { handled: true, profile };
+  }
+
+  if (state.step === 'onboarding_ask_budget_category') {
+    const index = Number(state.data && state.data.categoryIndex);
+
+    if (!Number.isInteger(index) || index < 0 || index >= ALLOWED_CATEGORIES.length) {
+      const updated = await finalizeOnboarding(sock, jid, userNumber);
+      return { handled: true, profile: updated };
+    }
+
+    const category = ALLOWED_CATEGORIES[index];
+    let categoryValue = null;
+
+    if (!isSkipKeyword(text)) {
+      const parsed = parseMoney(text);
+
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        await safeReply(
+          sock,
+          jid,
+          `Não consegui ler o orçamento de ${category}. Envie apenas número (ex: 1200) ou "pular".`
+        );
+        return { handled: true, profile };
+      }
+
+      categoryValue = Number(parsed.toFixed(2));
+    }
+
+    const updated = await updateUserProfile(userNumber, {
+      budgetByCategory: {
+        [category]: categoryValue
+      }
+    });
+
+    const nextIndex = index + 1;
+
+    if (nextIndex >= ALLOWED_CATEGORIES.length) {
+      const finished = await finalizeOnboarding(sock, jid, userNumber);
+      return { handled: true, profile: finished };
+    }
+
+    await setConversationState(
+      userNumber,
+      {
+        step: 'onboarding_ask_budget_category',
+        data: { categoryIndex: nextIndex }
+      },
+      CONVERSATION_STATE_TTL_SECONDS
+    );
+
+    await safeReply(
+      sock,
+      jid,
+      `Perfeito. Agora, qual orçamento mensal para *${ALLOWED_CATEGORIES[nextIndex]}*? (número ou "pular")`
+    );
+
+    return { handled: true, profile: updated };
+  }
+
+  await startOnboarding(sock, jid, userNumber);
+  return { handled: true, profile };
+}
+
+function parseProfileCommand(commandText, originalText) {
+  if (/^(\/)?(meu perfil|perfil)$/.test(commandText)) {
+    return { action: 'show_profile' };
+  }
+
+  if (/^(\/)?(reconfigurar perfil|refazer cadastro|cadastro novamente)$/.test(commandText)) {
+    return { action: 'restart_onboarding' };
+  }
+
+  const nameMatch = originalText.match(/^(?:\/?(?:nome|alterar nome|me chame de))\s+(.+)$/i);
+
+  if (nameMatch && nameMatch[1]) {
+    return {
+      action: 'set_name',
+      name: sanitizeText(nameMatch[1])
+    };
+  }
+
+  const incomeMatch = originalText.match(/^(?:\/?(?:renda|ganho|salario|salário)(?:\s+mensal)?)\s+(.+)$/i);
+
+  if (incomeMatch && incomeMatch[1]) {
+    const value = parseMoney(incomeMatch[1]);
+
+    if (Number.isFinite(value) && value > 0) {
+      return {
+        action: 'set_income',
+        monthlyIncome: Number(value.toFixed(2))
+      };
+    }
+
+    return { action: 'invalid_income' };
+  }
+
+  const clearBudgetMatch = commandText.match(/^(\/)?(limpar orcamento|limpar orçamento|remover orcamento|remover orçamento)\s+(.+)$/);
+
+  if (clearBudgetMatch && clearBudgetMatch[3]) {
+    const category = parseCategoryFromText(clearBudgetMatch[3]);
+
+    if (!category) {
+      return { action: 'invalid_budget_category' };
+    }
+
+    return {
+      action: 'clear_budget',
+      category
+    };
+  }
+
+  const budgetMatch = originalText.match(/^(?:\/?(?:orcamento|orçamento))\s+(.+)$/i);
+
+  if (budgetMatch && budgetMatch[1]) {
+    const budgetText = budgetMatch[1];
+    const category = parseCategoryFromText(normalizeCommandText(budgetText));
+
+    if (!category) {
+      return { action: 'invalid_budget_category' };
+    }
+
+    const value = parseMoney(budgetText);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return { action: 'invalid_budget_value', category };
+    }
+
+    return {
+      action: 'set_budget',
+      category,
+      value: Number(value.toFixed(2))
+    };
+  }
+
+  const alertsMatch = originalText.match(/^(?:\/?(?:alertas|alerta))\s+(.+)$/i);
+
+  if (alertsMatch && alertsMatch[1]) {
+    const numbers = alertsMatch[1]
+      .match(/\d{1,2}/g);
+
+    if (!numbers || numbers.length === 0) {
+      return { action: 'invalid_alerts' };
+    }
+
+    const thresholds = [...new Set(
+      numbers
+        .map((item) => Number.parseInt(item, 10))
+        .filter((item) => Number.isInteger(item) && item > 0 && item < 100)
+    )].sort((a, b) => a - b);
+
+    if (!thresholds.length) {
+      return { action: 'invalid_alerts' };
+    }
+
+    return {
+      action: 'set_alerts',
+      thresholds
+    };
+  }
+
+  return null;
+}
+
+async function handleProfileCommand(sock, jid, userNumber, profile, command) {
+  if (!command) {
+    return false;
+  }
+
+  if (command.action === 'show_profile') {
+    await safeReply(sock, jid, buildProfileMessage(profile));
     return true;
   }
+
+  if (command.action === 'restart_onboarding') {
+    const updated = await updateUserProfile(userNumber, {
+      onboardingComplete: false
+    });
+
+    await clearConversationState(userNumber);
+    await startOnboarding(sock, jid, userNumber);
+    logInfo('WHATSAPP', 'Onboarding reiniciado pelo usuário.', { user: userNumber, name: updated.name });
+    return true;
+  }
+
+  if (command.action === 'set_name') {
+    if (!command.name || command.name.length < 2) {
+      await safeReply(sock, jid, 'Não consegui salvar esse nome. Tenta no formato: nome João');
+      return true;
+    }
+
+    const updated = await updateUserProfile(userNumber, {
+      name: command.name
+    });
+
+    await safeReply(sock, jid, `Perfeito! Vou te chamar de ${updated.name}.`);
+    return true;
+  }
+
+  if (command.action === 'set_income') {
+    const updated = await updateUserProfile(userNumber, {
+      monthlyIncome: command.monthlyIncome
+    });
+
+    await safeReply(sock, jid, `Renda mensal atualizada: ${formatCurrencyBRL(updated.monthlyIncome)}.`);
+    return true;
+  }
+
+  if (command.action === 'invalid_income') {
+    await safeReply(sock, jid, 'Não consegui entender a renda. Exemplo: renda 5500');
+    return true;
+  }
+
+  if (command.action === 'set_budget') {
+    await updateUserProfile(userNumber, {
+      budgetByCategory: {
+        [command.category]: command.value
+      }
+    });
+
+    await safeReply(sock, jid, `Orçamento de ${command.category} salvo em ${formatCurrencyBRL(command.value)} por mês.`);
+    return true;
+  }
+
+  if (command.action === 'clear_budget') {
+    await updateUserProfile(userNumber, {
+      budgetByCategory: {
+        [command.category]: null
+      }
+    });
+
+    await safeReply(sock, jid, `Orçamento de ${command.category} removido.`);
+    return true;
+  }
+
+  if (command.action === 'set_alerts') {
+    await updateUserProfile(userNumber, {
+      alertThresholds: command.thresholds,
+      alertSent: {}
+    });
+
+    await safeReply(
+      sock,
+      jid,
+      `Alertas atualizados (saldo restante) para: ${command.thresholds.join('% / ')}%.`
+    );
+    return true;
+  }
+
+  if (command.action === 'invalid_alerts') {
+    await safeReply(sock, jid, 'Formato inválido. Exemplo: alertas 10 20 30');
+    return true;
+  }
+
+  if (command.action === 'invalid_budget_category') {
+    await safeReply(sock, jid, 'Não identifiquei a categoria. Use: alimentação, transporte, lazer ou outros.');
+    return true;
+  }
+
+  if (command.action === 'invalid_budget_value') {
+    await safeReply(sock, jid, `Não consegui entender o valor do orçamento de ${command.category}. Exemplo: orçamento ${command.category.toLowerCase()} 1200`);
+    return true;
+  }
+
+  return false;
+}
+
+async function tryHandleBudgetStatus(sock, jid, userNumber, text, referenceDate, profile) {
+  const commandText = normalizeCommandText(text);
+
+  if (!hasBudgetStatusIntent(commandText)) {
+    return false;
+  }
+
+  const resolvedMonth = resolveSummaryMonth(commandText, referenceDate);
+  const summary = await getMonthlySummaryByUser(
+    userNumber,
+    resolvedMonth.year,
+    resolvedMonth.month
+  );
+
+  await safeReply(
+    sock,
+    jid,
+    buildBudgetStatusMessage(profile, summary, resolvedMonth.label)
+  );
+
+  return true;
+}
+
+async function tryHandleFinanceSummary(sock, jid, userNumber, text, referenceDate, profile) {
+  const commandText = normalizeCommandText(text);
 
   if (!hasMonthlySummaryIntent(commandText)) {
     return false;
   }
 
-  const requestedCategory = extractRequestedCategory(commandText);
+  const requestedCategory = parseCategoryFromText(commandText);
   const resolvedMonth = resolveSummaryMonth(commandText, referenceDate);
   const summary = await getMonthlySummaryByUser(
     userNumber,
@@ -363,7 +1235,7 @@ async function tryHandleFinanceCommand(sock, jid, userNumber, text, referenceDat
     return true;
   }
 
-  await safeReply(sock, jid, buildMonthlySummaryMessage(summary, resolvedMonth.label));
+  await safeReply(sock, jid, buildMonthlySummaryMessage(summary, resolvedMonth.label, profile));
   logInfo('WHATSAPP', 'Resumo mensal enviado.', {
     user: userNumber,
     month: resolvedMonth.label,
@@ -371,6 +1243,276 @@ async function tryHandleFinanceCommand(sock, jid, userNumber, text, referenceDat
     count: summary.count
   });
   return true;
+}
+
+async function tryHandleListExpenses(sock, jid, userNumber, text) {
+  const commandText = normalizeCommandText(text);
+
+  if (!shouldListExpenses(commandText)) {
+    return false;
+  }
+
+  const listLimit = parseListLimit(text);
+  const list = await getRecentTransactionsByUser(userNumber, listLimit);
+  await safeReply(sock, jid, buildRecentExpensesMessage(list));
+  return true;
+}
+
+async function tryHandleDeleteExpense(sock, jid, userNumber, text) {
+  const intent = parseDeleteIntent(text);
+
+  if (!intent) {
+    return false;
+  }
+
+  let transactionId = intent.transactionId;
+
+  let autoSelectedLast = false;
+
+  if (intent.target === 'last' || intent.target === 'last_auto') {
+    const [latest] = await getRecentTransactionsByUser(userNumber, 1);
+
+    if (!latest) {
+      await safeReply(sock, jid, 'Você ainda não tem gastos para remover.');
+      return true;
+    }
+
+    transactionId = latest.id;
+    autoSelectedLast = intent.target === 'last_auto';
+  }
+
+  if (!transactionId) {
+    await safeReply(sock, jid, 'Me informe o ID do gasto. Exemplo: remover gasto tx_ab12cd34');
+    return true;
+  }
+
+  const removed = await deleteTransactionById(userNumber, transactionId);
+
+  if (!removed) {
+    await safeReply(sock, jid, `Não encontrei gasto com ID ${transactionId}. Use "listar gastos" para ver os IDs.`);
+    return true;
+  }
+
+  await safeReply(
+    sock,
+    jid,
+    [
+      autoSelectedLast ? '🗑️ Não veio ID, então removi seu último gasto registrado:' : '🗑️ Gasto removido com sucesso:',
+      `ID: ${removed.id}`,
+      `Valor: ${formatCurrencyBRL(removed.valor)}`,
+      `Categoria: ${removed.categoria}`,
+      `Descrição: ${removed.descricao}`,
+      `Data: ${formatDateBR(removed.data)}`
+    ].join('\n')
+  );
+
+  return true;
+}
+
+async function parseUpdatePatch(text, referenceDate) {
+  const aiPatch = await parseTransactionPatchWithAI(text, referenceDate);
+
+  if (aiPatch) {
+    return aiPatch;
+  }
+
+  return parsePatchFromTextFallback(text, referenceDate);
+}
+
+async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate) {
+  const intent = parseEditIntent(text);
+
+  if (!intent) {
+    return false;
+  }
+
+  let transactionId = intent.transactionId;
+
+  let autoSelectedLast = false;
+
+  if (intent.target === 'last' || intent.target === 'last_auto') {
+    const [latest] = await getRecentTransactionsByUser(userNumber, 1);
+
+    if (!latest) {
+      await safeReply(sock, jid, 'Você ainda não tem gastos para editar.');
+      return true;
+    }
+
+    transactionId = latest.id;
+    autoSelectedLast = intent.target === 'last_auto';
+  }
+
+  if (!transactionId) {
+    await safeReply(sock, jid, 'Me informe o ID do gasto para editar. Exemplo: editar gasto tx_ab12cd34 para 45 no mercado');
+    return true;
+  }
+
+  const updateText = sanitizeText(intent.updateText);
+  const patch = await parseUpdatePatch(updateText, referenceDate);
+
+  if (!patch) {
+    await safeReply(
+      sock,
+      jid,
+      [
+        'Não consegui identificar o que você quer alterar.',
+        'Exemplos:',
+        '- editar gasto tx_ab12 para valor 79,90',
+        '- corrigir ultimo gasto para uber 35 ontem',
+        '- editar gasto tx_ab12 descrição almoço no shopping'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  const updated = await updateTransactionById(userNumber, transactionId, patch);
+
+  if (!updated) {
+    await safeReply(sock, jid, `Não encontrei gasto com ID ${transactionId}. Use "listar gastos" para ver os IDs.`);
+    return true;
+  }
+
+  await safeReply(
+    sock,
+    jid,
+    [
+      autoSelectedLast ? '✏️ Não veio ID, então atualizei seu último gasto:' : '✏️ Gasto atualizado:',
+      `ID: ${updated.id}`,
+      `Valor: ${formatCurrencyBRL(updated.valor)}`,
+      `Categoria: ${updated.categoria}`,
+      `Descrição: ${updated.descricao}`,
+      `Data: ${formatDateBR(updated.data)}`
+    ].join('\n')
+  );
+
+  return true;
+}
+
+function buildNaturalSuccessMessage(profile, transaction, monthSummary) {
+  const hasName = profile && profile.name;
+  const openers = hasName
+    ? [
+      `${profile.name}, anotei aqui ✅`,
+      `Perfeito, ${profile.name}! Já registrei ✅`,
+      `${profile.name}, lançado com sucesso ✅`
+    ]
+    : [
+      'Anotei aqui ✅',
+      'Lançamento registrado ✅',
+      'Perfeito, já salvei ✅'
+    ];
+  const greeting = openers[Math.floor(Math.random() * openers.length)];
+
+  const categoryTotal = Number(monthSummary.byCategory[transaction.categoria] || 0);
+  const monthLabel = monthLabelFromIsoDate(transaction.data);
+
+  return [
+    greeting,
+    `• ID: ${transaction.id}`,
+    `• Valor: ${formatCurrencyBRL(transaction.valor)}`,
+    `• Categoria: ${transaction.categoria}`,
+    `• Descrição: ${transaction.descricao}`,
+    `• Data: ${formatDateBR(transaction.data)}`,
+    '',
+    `No mês (${monthLabel}):`,
+    `• Total geral: ${formatCurrencyBRL(monthSummary.total)}`,
+    `• Total em ${transaction.categoria}: ${formatCurrencyBRL(categoryTotal)}`,
+    '',
+    `Se precisar corrigir: "editar gasto ${transaction.id} para 45 no mercado".`
+  ].join('\n');
+}
+
+function evaluateBudgetAlert(profile, monthSummary, transaction) {
+  if (!profile || !profile.budgetByCategory || !transaction) {
+    return null;
+  }
+
+  const category = transaction.categoria;
+  const budgetValue = Number(profile.budgetByCategory[category]);
+
+  if (!Number.isFinite(budgetValue) || budgetValue <= 0) {
+    return null;
+  }
+
+  const spent = Number(monthSummary.byCategory[category] || 0);
+
+  if (!Number.isFinite(spent) || spent <= 0) {
+    return null;
+  }
+
+  const monthKey = sanitizeText(transaction.data).slice(0, 7);
+
+  if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+    return null;
+  }
+
+  const alertKey = `${monthKey}:${category}`;
+  const sentMap = profile.alertSent && typeof profile.alertSent === 'object'
+    ? profile.alertSent
+    : {};
+  const sentThresholds = Array.isArray(sentMap[alertKey])
+    ? sentMap[alertKey]
+      .map((item) => Number.parseInt(String(item), 10))
+      .filter((item) => Number.isInteger(item))
+    : [];
+  const alreadyExceededAlerted = sentThresholds.includes(100);
+
+  const thresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
+    ? profile.alertThresholds
+      .map((item) => Number.parseInt(String(item), 10))
+      .filter((item) => Number.isInteger(item) && item > 0 && item < 100)
+      .sort((a, b) => a - b)
+    : [...DEFAULT_ALERT_THRESHOLDS];
+
+  const remainingValue = Math.max(0, budgetValue - spent);
+  const remainingPercent = budgetValue > 0 ? (remainingValue / budgetValue) * 100 : 0;
+  const newlyReached = thresholds.filter(
+    (threshold) => remainingPercent <= threshold && !sentThresholds.includes(threshold)
+  );
+
+  if (!newlyReached.length && spent < budgetValue) {
+    return null;
+  }
+
+  if (spent >= budgetValue && alreadyExceededAlerted) {
+    return null;
+  }
+
+  const updatedSent = [...new Set([
+    ...sentThresholds,
+    ...newlyReached,
+    ...(spent >= budgetValue ? [100] : [])
+  ])].sort((a, b) => a - b);
+  const thresholdTriggered = newlyReached.length ? Math.min(...newlyReached) : Math.min(...thresholds);
+  const monthLabel = `${monthKey.slice(5, 7)}/${monthKey.slice(0, 4)}`;
+
+  let message;
+
+  if (spent >= budgetValue) {
+    message = [
+      `⚠️ Atenção: você excedeu o orçamento de ${category} em ${monthLabel}.`,
+      `Gasto: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budgetValue)}.`
+    ].join('\n');
+  } else {
+    message = [
+      `⚠️ Alerta de orçamento: faltam ${thresholdTriggered}% ou menos em ${category} (${monthLabel}).`,
+      `Gasto: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budgetValue)}.`,
+      `Saldo restante: ${formatCurrencyBRL(remainingValue)} (${Math.round(remainingPercent)}%).`
+    ].join('\n');
+  }
+
+  return {
+    message,
+    profilePatch: {
+      alertSent: {
+        [alertKey]: updatedSent
+      }
+    }
+  };
+}
+
+function isHelpCommand(commandText) {
+  return /^(\/)?(ajuda|comandos?)\b/.test(commandText);
 }
 
 function isSupportedDirectChat(jid) {
@@ -440,6 +1582,7 @@ async function processIncomingMessage(sock, message) {
     }
 
     const userNumber = normalizeUserId(jid);
+
     if (shouldLogMessages()) {
       logInfo('WHATSAPP', 'Mensagem recebida.', {
         jid,
@@ -449,16 +1592,83 @@ async function processIncomingMessage(sock, message) {
     }
 
     const referenceDate = new Date();
+    const commandText = normalizeCommandText(text);
 
-    const commandHandled = await tryHandleFinanceCommand(
+    let profile = await getUserProfile(userNumber);
+
+    if (!profile) {
+      profile = await updateUserProfile(userNumber, {});
+    }
+
+    const conversationState = await getConversationState(userNumber);
+    const onboardingResult = await handleOnboardingFlow(
       sock,
       jid,
       userNumber,
       text,
-      referenceDate
+      profile,
+      conversationState
     );
 
-    if (commandHandled) {
+    if (onboardingResult.handled) {
+      return;
+    }
+
+    profile = onboardingResult.profile || profile;
+
+    if (isHelpCommand(commandText)) {
+      await safeReply(sock, jid, buildHelpMessage());
+      return;
+    }
+
+    const budgetStatusHandled = await tryHandleBudgetStatus(
+      sock,
+      jid,
+      userNumber,
+      text,
+      referenceDate,
+      profile
+    );
+
+    if (budgetStatusHandled) {
+      return;
+    }
+
+    const profileCommand = parseProfileCommand(commandText, text);
+    const profileCommandHandled = await handleProfileCommand(sock, jid, userNumber, profile, profileCommand);
+
+    if (profileCommandHandled) {
+      return;
+    }
+
+    const summaryHandled = await tryHandleFinanceSummary(
+      sock,
+      jid,
+      userNumber,
+      text,
+      referenceDate,
+      profile
+    );
+
+    if (summaryHandled) {
+      return;
+    }
+
+    const listHandled = await tryHandleListExpenses(sock, jid, userNumber, text);
+
+    if (listHandled) {
+      return;
+    }
+
+    const deleteHandled = await tryHandleDeleteExpense(sock, jid, userNumber, text);
+
+    if (deleteHandled) {
+      return;
+    }
+
+    const editHandled = await tryHandleEditExpense(sock, jid, userNumber, text, referenceDate);
+
+    if (editHandled) {
       return;
     }
 
@@ -484,7 +1694,17 @@ async function processIncomingMessage(sock, message) {
     }
 
     if (!transaction) {
-      await safeReply(sock, jid, 'Não consegui entender, pode tentar novamente?');
+      await safeReply(
+        sock,
+        jid,
+        [
+          'Não consegui entender esse lançamento.',
+          'Exemplos que funcionam bem:',
+          '- gastei 45 no mercado',
+          '- uber 30 hoje',
+          '- paguei 120 no ifood ontem'
+        ].join('\n')
+      );
       return;
     }
 
@@ -496,7 +1716,21 @@ async function processIncomingMessage(sock, message) {
       return;
     }
 
-    await safeReply(sock, jid, buildSuccessMessage(saveResult.record));
+    const transactionDate = sanitizeText(saveResult.record.data);
+    const summaryYear = Number.parseInt(transactionDate.slice(0, 4), 10);
+    const summaryMonth = Number.parseInt(transactionDate.slice(5, 7), 10);
+
+    const monthSummary = await getMonthlySummaryByUser(userNumber, summaryYear, summaryMonth);
+    await safeReply(sock, jid, buildNaturalSuccessMessage(profile, saveResult.record, monthSummary));
+
+    const refreshedProfile = await getUserProfile(userNumber);
+    const budgetAlert = evaluateBudgetAlert(refreshedProfile, monthSummary, saveResult.record);
+
+    if (budgetAlert) {
+      await updateUserProfile(userNumber, budgetAlert.profilePatch);
+      await safeReply(sock, jid, budgetAlert.message);
+    }
+
     logInfo('WHATSAPP', 'Transação processada com sucesso.', saveResult.record);
   } catch (error) {
     logError('WHATSAPP', 'Erro ao processar mensagem.', error.message);
@@ -532,7 +1766,7 @@ function scheduleReconnect() {
   }, RECONNECT_DELAY_MS);
 }
 
-function createConnectionUpdateHandler(sock, state, authContext) {
+function createConnectionUpdateHandler(sock, state, authContext, disconnectReasonMap) {
   let pairingCodeRequested = false;
   let pairingHintLogged = false;
 
@@ -589,7 +1823,8 @@ function createConnectionUpdateHandler(sock, state, authContext) {
           lastDisconnect.error.output
           ? lastDisconnect.error.output.statusCode
           : undefined;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const loggedOutCode = disconnectReasonMap && disconnectReasonMap.loggedOut;
+        const shouldReconnect = statusCode !== loggedOutCode;
 
         logWarn('WHATSAPP', 'Conexão encerrada.', {
           statusCode,
@@ -613,16 +1848,20 @@ function createConnectionUpdateHandler(sock, state, authContext) {
 }
 
 async function createSocket() {
+  const { makeWASocket, fetchLatestBaileysVersion, DisconnectReason } = await getBaileysRuntime();
   const authContext = await loadWhatsAppAuthState();
   const { state, saveCreds } = authContext;
+
   try {
     let version;
 
-    try {
-      const latest = await fetchLatestBaileysVersion();
-      version = latest.version;
-    } catch (error) {
-      logWarn('WHATSAPP', 'Não foi possível buscar a versão mais recente do Baileys.');
+    if (typeof fetchLatestBaileysVersion === 'function') {
+      try {
+        const latest = await fetchLatestBaileysVersion();
+        version = latest.version;
+      } catch (_error) {
+        logWarn('WHATSAPP', 'Não foi possível buscar a versão mais recente do Baileys.');
+      }
     }
 
     const socketConfig = {
@@ -649,11 +1888,17 @@ async function createSocket() {
       }
     });
 
-    const handleConnectionUpdate = createConnectionUpdateHandler(sock, state, authContext);
+    const handleConnectionUpdate = createConnectionUpdateHandler(
+      sock,
+      state,
+      authContext,
+      DisconnectReason
+    );
 
     sock.ev.on('connection.update', async (update) => {
       await handleConnectionUpdate(update);
     });
+
     sock.ev.on('messages.upsert', async (event) => {
       await handleMessagesUpsert(sock, event);
     });

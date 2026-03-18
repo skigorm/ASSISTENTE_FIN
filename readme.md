@@ -1,79 +1,139 @@
-# 🤖 Assistente Financeiro com IA (WhatsApp)
+# Assistente Financeiro no WhatsApp (Node.js + Baileys + OpenAI)
 
-Um assistente inteligente para controle financeiro via WhatsApp, capaz de registrar gastos através de texto ou imagem (comprovantes), utilizando IA para categorização automática.
+Bot financeiro para WhatsApp com:
+- registro de gastos por linguagem natural
+- onboarding de novos usuários
+- perfil financeiro (nome, renda, orçamento por categoria)
+- alertas de orçamento
+- edição e remoção de despesas
+- persistência em Redis (Heroku) com fallback em arquivo
 
-## 🚀 Objetivo
+## Como funciona
 
-Permitir que o usuário controle suas finanças de forma simples, enviando mensagens no WhatsApp como:
+1. Usuário envia mensagem no WhatsApp (ex: `gastei 45 no mercado ontem`).
+2. O bot tenta interpretar com OpenAI.
+3. Se a OpenAI falhar, usa fallback local por regex.
+4. Salva transação com ID.
+5. Responde com confirmação natural + resumo do mês.
+6. Dispara alerta se orçamento por categoria estiver perto de acabar.
 
-- "Gastei 50 reais no mercado"
-- Foto de comprovante de compra
+## Fluxo de primeiro uso (onboarding)
 
-E o sistema automaticamente:
-- Extrai os dados
-- Categoriza o gasto
-- Armazena
-- Gera relatórios
+Na primeira conversa, o bot pergunta:
+- como chamar o usuário (nome)
+- se deseja informar renda mensal
+- se deseja definir orçamento por categoria
 
----
+Categorias padrão:
+- Alimentação
+- Transporte
+- Lazer
+- Outros
 
-## 🧠 Funcionalidades
+Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 
-- 📥 Entrada de dados via WhatsApp
-- 🧾 Leitura de comprovantes (OCR)
-- 🧠 Classificação automática com IA
-- 💾 Armazenamento de gastos
-- 📊 Resumo financeiro (diário/mensal)
-- 🔍 Consulta por categoria
-- ⚠️ Alertas de gastos
+## Comandos principais (WhatsApp)
 
-## 💬 Comandos de Consulta (WhatsApp)
-
-Use em conversa privada com o bot:
-
+- `ajuda`
 - `resumo do mes`
-- `total do mes`
+- `resumo 03/2026`
 - `total por categoria`
 - `total alimentação no mes`
-- `total transporte no mes`
-- `total lazer no mes`
-- `resumo 03/2026`
-- `ajuda` (lista comandos)
+- `como estao minhas contas`
+- `orçamento do mes`
+- `saldo do mes`
+- `listar gastos`
+- `listar gastos 20`
+- `remover gasto <id>`
+- `remover ultimo gasto`
+- `desfazer ultimo gasto`
+- `editar gasto <id> para 45 no mercado ontem`
+- `corrigir ultimo gasto para uber 32 hoje`
+- `meu perfil`
+- `nome Igor`
+- `renda 8500`
+- `orçamento alimentação 1200`
+- `limpar orçamento alimentação`
+- `alertas 10 20 30`
+- `reconfigurar perfil`
 
-## ⚙️ Variáveis de Ambiente (Heroku)
+## Pareamento (código, sem QR)
 
-- `OPENAI_KEY`: chave da OpenAI
-- `WHATSAPP_PAIRING_NUMBER`: número fixo para gerar código de pareamento (com DDI, só dígitos)
-- `REDIS_URL`: URL do Heroku Redis (injetada automaticamente pelo add-on)
-- `WHATSAPP_AUTH_PREFIX`: prefixo das chaves de sessão no Redis
-- `WHATSAPP_DATA_PREFIX`: prefixo das chaves de gastos no Redis
-- `REDIS_TLS`: habilita TLS no cliente Redis (`true` no Heroku)
-- `REDIS_TLS_REJECT_UNAUTHORIZED`: validação de certificado TLS (`false` para Heroku Redis self-signed)
+1. Defina `WHATSAPP_PAIRING_NUMBER` (somente dígitos, com DDI).
+2. Abra `https://SEU-APP.herokuapp.com/pairing`.
+3. Copie o código exibido.
+4. No celular do número do WhatsApp:
+   - WhatsApp → Dispositivos conectados → Conectar com número de telefone
+   - cole o código.
 
-## 🔐 Pareamento com Número Fixo
+## Variáveis de ambiente
 
-1. Configure `WHATSAPP_PAIRING_NUMBER` com o número do bot (DDI + DDD + número, apenas dígitos).
-2. Acesse `/pairing` para ver o código de pareamento (sem QR).
-3. No celular do número do bot: `Dispositivos conectados` → `Conectar com número de telefone`.
-4. Digite o código mostrado na página.
+Use `.env.example` como base:
 
-Com `REDIS_URL` ativo, a sessão do WhatsApp fica persistida e evita novo pareamento a cada deploy/restart.
+- `OPENAI_KEY=...`
+- `OPENAI_MODEL=gpt-4o-mini` (opcional)
+- `WHATSAPP_PAIRING_NUMBER=55619...`
+- `DISABLE_WHATSAPP_BOT=false`
+- `WHATSAPP_LOG_MESSAGES=true`
+- `WHATSAPP_LOG_IGNORED_MESSAGES=false`
+- `REDIS_URL=...`
+- `WHATSAPP_AUTH_PREFIX=finance-bot:baileys-auth`
+- `WHATSAPP_DATA_PREFIX=finance-bot:transactions`
+- `REDIS_TLS=true`
+- `REDIS_TLS_REJECT_UNAUTHORIZED=false`
 
-## 💾 Persistência dos Gastos
+## Persistência de dados
 
-- Com `REDIS_URL` configurado, os gastos são gravados no Redis (persistente no Heroku), não só no `data/transactions.json`.
-- Isso evita perda dos lançamentos em restart/redeploy do dyno.
-- Sem Redis, o bot cai em fallback para arquivo local, e esse arquivo pode ser perdido no ciclo de vida do dyno Heroku.
+### Sessão do WhatsApp
+- preferencialmente no Redis (`WHATSAPP_AUTH_PREFIX`)
+- fallback local em `data/baileys_auth` se Redis indisponível
 
----
+### Dados financeiros
+- preferencialmente no Redis (`WHATSAPP_DATA_PREFIX`)
+- fallback local:
+  - `data/transactions.json`
+  - `data/users.json`
 
-## 🏗️ Arquitetura (MVP)
+## Redis no Heroku
+
+1. Adicione o add-on Redis:
+```bash
+heroku addons:create heroku-redis:mini
+```
+2. Confirme:
+```bash
+heroku config:get REDIS_URL
+```
+3. Configure TLS:
+```bash
+heroku config:set REDIS_TLS=true REDIS_TLS_REJECT_UNAUTHORIZED=false
+```
+
+## Rodar local
 
 ```bash
-WhatsApp (Twilio / Meta API)
-        ↓
-Webhook (Node.js / Express)
-        ↓
-Processamento IA (OpenAI)
-        ↓
-Banco de Dados (SQLite / PostgreSQL)
+nvm use 23
+npm install
+npm start
+```
+
+App HTTP:
+- `GET /` -> `finance-bot online`
+- `GET /health` -> `{ "ok": true, "service": "finance-bot" }`
+- `GET /pairing` -> página de pareamento
+- `GET /pairing/status` -> status do WhatsApp
+
+## Deploy Heroku
+
+`Procfile`:
+```txt
+worker: node src/app.js
+```
+
+Se usar dyno `web`, também funciona, pois há servidor HTTP em `process.env.PORT`.
+
+## Observações importantes
+
+- O bot responde apenas em chat direto (não responde em grupos/newsletter).
+- Mensagens promocionais tendem a ser ignoradas para reduzir falso positivo.
+- Se OpenAI estiver sem quota, o fallback local continua ativo para casos simples.
