@@ -1,4 +1,5 @@
-const ALLOWED_CATEGORIES = ['Alimentação', 'Transporte', 'Lazer', 'Outros'];
+const BASE_CATEGORIES = ['Alimentação', 'Transporte', 'Lazer', 'Outros'];
+const ALLOWED_CATEGORIES = BASE_CATEGORIES;
 
 function log(level, scope, message, meta) {
   const timestamp = new Date().toISOString();
@@ -34,6 +35,32 @@ function sanitizeText(input) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 500);
+}
+
+function stripAccents(text) {
+  return String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function normalizeCategoryName(inputCategory, fallback = 'Outros') {
+  const raw = sanitizeText(String(inputCategory || ''));
+
+  if (!raw) {
+    return fallback;
+  }
+
+  const normalizedSpacing = raw.replace(/\s+/g, ' ').trim();
+
+  if (!normalizedSpacing) {
+    return fallback;
+  }
+
+  if (normalizedSpacing.length <= 40) {
+    return normalizedSpacing.charAt(0).toUpperCase() + normalizedSpacing.slice(1);
+  }
+
+  return fallback;
 }
 
 function safeJsonParse(raw) {
@@ -114,11 +141,34 @@ function parseMoney(value) {
   return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
 
-function normalizeCategory(inputCategory) {
-  const normalized = sanitizeText(String(inputCategory || '')).toLowerCase();
+function normalizeCategory(inputCategory, customCategories = []) {
+  const normalized = stripAccents(sanitizeText(String(inputCategory || '')).toLowerCase());
+  const normalizedCustom = Array.isArray(customCategories)
+    ? customCategories
+      .map((item) => normalizeCategoryName(item, ''))
+      .filter(Boolean)
+    : [];
 
   if (!normalized) {
     return 'Outros';
+  }
+
+  for (const category of normalizedCustom) {
+    const normalizedCategory = stripAccents(category.toLowerCase());
+
+    if (!normalizedCategory) {
+      continue;
+    }
+
+    if (normalized.includes(normalizedCategory)) {
+      return category;
+    }
+
+    const tokenMatch = normalizedCategory.split(' ').filter(Boolean);
+
+    if (tokenMatch.length && tokenMatch.every((token) => normalized.includes(token))) {
+      return category;
+    }
   }
 
   if (normalized.includes('aliment')) {
@@ -140,8 +190,24 @@ function normalizeCategory(inputCategory) {
   return 'Outros';
 }
 
-function inferCategoryFromText(text) {
-  const normalized = sanitizeText(text).toLowerCase();
+function inferCategoryFromText(text, customCategories = []) {
+  const normalized = stripAccents(sanitizeText(text).toLowerCase());
+
+  if (Array.isArray(customCategories)) {
+    for (const category of customCategories) {
+      const safeCategory = normalizeCategoryName(category, '');
+
+      if (!safeCategory) {
+        continue;
+      }
+
+      const normalizedCategory = stripAccents(safeCategory.toLowerCase());
+
+      if (normalized.includes(normalizedCategory)) {
+        return safeCategory;
+      }
+    }
+  }
 
   if (/(mercado|ifood|restaurante|comida|lanche|pizza|padaria|caf[eé]|janta|almo[cç]o)/i.test(normalized)) {
     return 'Alimentação';
@@ -244,7 +310,7 @@ function validateTransaction(transaction) {
     errors.push('Valor inválido');
   }
 
-  if (!ALLOWED_CATEGORIES.includes(transaction.categoria)) {
+  if (typeof transaction.categoria !== 'string' || !sanitizeText(transaction.categoria)) {
     errors.push('Categoria inválida');
   }
 
@@ -268,14 +334,19 @@ function validateTransaction(transaction) {
   };
 }
 
-function normalizeTransaction(payload, referenceDate = new Date()) {
+function normalizeTransaction(payload, referenceDate = new Date(), options = {}) {
   if (!payload || typeof payload !== 'object') {
     return { valid: false, errors: ['Payload vazio ou inválido'] };
   }
 
   const normalized = {
     valor: parseMoney(payload.valor),
-    categoria: normalizeCategory(payload.categoria),
+    categoria: normalizeCategory(
+      payload.categoria,
+      Array.isArray(options.customCategories)
+        ? options.customCategories
+        : payload.customCategories || []
+    ),
     descricao: sanitizeText(payload.descricao || ''),
     data: normalizeDate(String(payload.data || ''), referenceDate)
   };
@@ -287,7 +358,7 @@ function normalizeTransaction(payload, referenceDate = new Date()) {
   return validateTransaction(normalized);
 }
 
-function fallbackParseTransaction(text, referenceDate = new Date()) {
+function fallbackParseTransaction(text, referenceDate = new Date(), options = {}) {
   const clean = sanitizeText(text);
 
   if (!clean) {
@@ -308,7 +379,7 @@ function fallbackParseTransaction(text, referenceDate = new Date()) {
 
   const candidate = {
     valor: value,
-    categoria: inferCategoryFromText(clean),
+    categoria: inferCategoryFromText(clean, options.customCategories || []),
     descricao: cleanupDescription(clean),
     data: parseDateFromText(clean, referenceDate)
   };
@@ -354,6 +425,7 @@ function delay(ms) {
 }
 
 module.exports = {
+  BASE_CATEGORIES,
   ALLOWED_CATEGORIES,
   cleanupDescription,
   delay,
@@ -365,6 +437,7 @@ module.exports = {
   logInfo,
   logWarn,
   normalizeCategory,
+  normalizeCategoryName,
   normalizeDate,
   normalizeTransaction,
   normalizeUserId,

@@ -87,7 +87,7 @@ async function callOpenAIJson(messages) {
   }
 }
 
-async function parseTransactionWithAI(text, referenceDate = new Date()) {
+async function parseTransactionWithAI(text, referenceDate = new Date(), options = {}) {
   const cleanText = sanitizeText(text);
 
   if (!cleanText) {
@@ -95,10 +95,11 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
   }
 
   const referenceDateISO = toISODate(referenceDate);
+  const customCategories = Array.isArray(options.customCategories) ? options.customCategories : [];
   const parsed = await callOpenAIJson([
     {
       role: 'system',
-      content: buildExtractionSystemPrompt(referenceDateISO)
+      content: buildExtractionSystemPrompt(referenceDateISO, customCategories)
     },
     {
       role: 'user',
@@ -110,7 +111,7 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
     return null;
   }
 
-  const normalized = normalizeTransaction(parsed, referenceDate);
+  const normalized = normalizeTransaction(parsed, referenceDate, { customCategories });
 
   if (!normalized.valid) {
     logWarn('AI', 'JSON da OpenAI inválido após normalização.', normalized.errors);
@@ -121,7 +122,7 @@ async function parseTransactionWithAI(text, referenceDate = new Date()) {
   return normalized.data;
 }
 
-async function parseTransactionPatchWithAI(text, referenceDate = new Date()) {
+async function parseTransactionPatchWithAI(text, referenceDate = new Date(), options = {}) {
   const cleanText = sanitizeText(text);
 
   if (!cleanText) {
@@ -129,10 +130,11 @@ async function parseTransactionPatchWithAI(text, referenceDate = new Date()) {
   }
 
   const referenceDateISO = toISODate(referenceDate);
+  const customCategories = Array.isArray(options.customCategories) ? options.customCategories : [];
   const parsed = await callOpenAIJson([
     {
       role: 'system',
-      content: buildUpdateSystemPrompt(referenceDateISO)
+      content: buildUpdateSystemPrompt(referenceDateISO, customCategories)
     },
     {
       role: 'user',
@@ -159,7 +161,7 @@ async function parseTransactionPatchWithAI(text, referenceDate = new Date()) {
   }
 
   if (maybeCategory !== null && maybeCategory !== undefined && sanitizeText(String(maybeCategory))) {
-    patch.categoria = normalizeCategory(maybeCategory);
+    patch.categoria = normalizeCategory(maybeCategory, customCategories);
   }
 
   if (maybeDescription !== null && maybeDescription !== undefined && sanitizeText(String(maybeDescription))) {

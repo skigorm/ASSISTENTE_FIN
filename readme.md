@@ -4,6 +4,7 @@ Bot financeiro para WhatsApp com:
 - registro de gastos por linguagem natural
 - onboarding de novos usuários
 - perfil financeiro (nome, renda, orçamento por categoria)
+- categorias personalizadas (ex: obra, dízimo, água, luz, alarme)
 - alertas de orçamento
 - edição e remoção de despesas
 - persistência em Redis (Heroku) com fallback em arquivo
@@ -30,6 +31,8 @@ Categorias padrão:
 - Lazer
 - Outros
 
+Você pode criar categorias novas a qualquer momento.
+
 Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 
 ## Comandos principais (WhatsApp)
@@ -53,6 +56,10 @@ Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 - `nome Igor`
 - `renda 8500`
 - `orçamento alimentação 1200`
+- `categorias`
+- `criar categoria obra`
+- `criar categoria água com orçamento 250`
+- `remover categoria obra`
 - `limpar orçamento alimentação`
 - `alertas 10 20 30`
 - `reconfigurar perfil`

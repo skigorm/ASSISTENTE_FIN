@@ -1,12 +1,18 @@
-function buildExtractionSystemPrompt(referenceDate) {
+function buildExtractionSystemPrompt(referenceDate, customCategories = []) {
+  const safeCustomCategories = Array.isArray(customCategories)
+    ? customCategories.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const categoryList = ['Alimentação', 'Transporte', 'Lazer', 'Outros', ...safeCustomCategories];
+  const categoryRule = categoryList.join('|');
+
   return [
     'Você extrai dados financeiros de mensagens informais em português.',
     'Responda apenas com JSON válido, sem markdown, sem texto adicional e sem comentários.',
     'Formato obrigatório de saída:',
-    '{"valor": number, "categoria": "Alimentação|Transporte|Lazer|Outros", "descricao": "string", "data": "YYYY-MM-DD"}',
+    `{"valor": number, "categoria": "${categoryRule}", "descricao": "string", "data": "YYYY-MM-DD"}`,
     'Regras obrigatórias:',
     '1) valor deve ser número positivo (use ponto para casas decimais).',
-    '2) categoria deve ser exatamente uma das opções: Alimentação, Transporte, Lazer, Outros.',
+    `2) categoria deve ser exatamente uma das opções: ${categoryList.join(', ')}.`,
     '3) descricao deve ser curta e objetiva.',
     '4) data deve estar no formato YYYY-MM-DD.',
     `5) Considere a data de referência como ${referenceDate}. Interprete termos relativos como hoje/ontem/anteontem.`,
@@ -15,12 +21,18 @@ function buildExtractionSystemPrompt(referenceDate) {
   ].join('\n');
 }
 
-function buildUpdateSystemPrompt(referenceDate) {
+function buildUpdateSystemPrompt(referenceDate, customCategories = []) {
+  const safeCustomCategories = Array.isArray(customCategories)
+    ? customCategories.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const categoryList = ['Alimentação', 'Transporte', 'Lazer', 'Outros', ...safeCustomCategories];
+  const categoryRule = categoryList.join('|');
+
   return [
     'Você extrai possíveis alterações de um gasto financeiro a partir de texto informal em português.',
     'Responda apenas com JSON válido, sem markdown, sem texto adicional e sem comentários.',
     'Formato obrigatório de saída:',
-    '{"valor": number|null, "categoria": "Alimentação|Transporte|Lazer|Outros"|null, "descricao": "string|null", "data": "YYYY-MM-DD|null"}',
+    `{"valor": number|null, "categoria": "${categoryRule}"|null, "descricao": "string|null", "data": "YYYY-MM-DD|null"}`,
     'Regras obrigatórias:',
     '1) Retorne null para campos não informados claramente.',
     '2) valor deve ser número positivo quando presente.',

@@ -2,7 +2,14 @@ const fs = require('fs/promises');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
 const { createClient } = require('redis');
-const { ALLOWED_CATEGORIES, logError, logInfo, logWarn, sanitizeText } = require('./utils');
+const {
+  ALLOWED_CATEGORIES,
+  logError,
+  logInfo,
+  logWarn,
+  normalizeCategoryName,
+  sanitizeText
+} = require('./utils');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const TRANSACTIONS_FILE = path.join(DATA_DIR, 'transactions.json');
@@ -99,7 +106,7 @@ function normalizeTransactionRecord(record, options = {}) {
 
   const user = sanitizeText(record.user);
   const valor = Number(record.valor);
-  const categoria = ALLOWED_CATEGORIES.includes(record.categoria) ? record.categoria : 'Outros';
+  const categoria = normalizeCategoryName(record.categoria, 'Outros');
   const descricao = sanitizeText(record.descricao);
   const data = sanitizeText(record.data);
 
@@ -155,10 +162,36 @@ function normalizeAlertThresholds(input) {
   return [...new Set(filtered)].sort((a, b) => a - b);
 }
 
-function normalizeBudgetByCategory(input) {
+function normalizeCustomCategories(input) {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  const normalized = input
+    .map((item) => normalizeCategoryName(item, ''))
+    .filter(Boolean)
+    .filter((item) => !ALLOWED_CATEGORIES.includes(item));
+
+  return [...new Set(normalized)];
+}
+
+function buildCategorySet(customCategories = []) {
+  const categories = [...ALLOWED_CATEGORIES];
+
+  for (const category of normalizeCustomCategories(customCategories)) {
+    if (!categories.includes(category)) {
+      categories.push(category);
+    }
+  }
+
+  return categories;
+}
+
+function normalizeBudgetByCategory(input, customCategories = []) {
+  const categorySet = buildCategorySet(customCategories);
   const result = {};
 
-  for (const category of ALLOWED_CATEGORIES) {
+  for (const category of categorySet) {
     result[category] = null;
   }
 
@@ -166,8 +199,17 @@ function normalizeBudgetByCategory(input) {
     return result;
   }
 
-  for (const category of ALLOWED_CATEGORIES) {
-    const raw = input[category];
+  for (const [rawCategory, raw] of Object.entries(input)) {
+    const category = normalizeCategoryName(rawCategory, '');
+
+    if (!category) {
+      continue;
+    }
+
+    if (!result[category]) {
+      result[category] = null;
+    }
+
     const value = Number(raw);
 
     if (Number.isFinite(value) && value > 0) {
@@ -217,12 +259,20 @@ function normalizeUserProfileRecord(user, profile = {}) {
 
   const nowIso = new Date().toISOString();
   const monthlyIncome = Number(profile.monthlyIncome);
+  const customFromList = normalizeCustomCategories(profile.customCategories);
+  const customFromBudgets = profile.budgetByCategory && typeof profile.budgetByCategory === 'object'
+    ? Object.keys(profile.budgetByCategory)
+      .map((item) => normalizeCategoryName(item, ''))
+      .filter((item) => item && !ALLOWED_CATEGORIES.includes(item))
+    : [];
+  const customCategories = [...new Set([...customFromList, ...customFromBudgets])];
 
   return {
     user: safeUser,
     name: sanitizeText(profile.name).slice(0, 80),
     monthlyIncome: Number.isFinite(monthlyIncome) && monthlyIncome > 0 ? roundTo2(monthlyIncome) : null,
-    budgetByCategory: normalizeBudgetByCategory(profile.budgetByCategory),
+    customCategories,
+    budgetByCategory: normalizeBudgetByCategory(profile.budgetByCategory, customCategories),
     alertThresholds: normalizeAlertThresholds(profile.alertThresholds),
     alertSent: normalizeAlertSentMap(profile.alertSent),
     onboardingComplete: Boolean(profile.onboardingComplete),
@@ -258,6 +308,7 @@ function buildDefaultProfile(user) {
   return normalizeUserProfileRecord(user, {
     name: '',
     monthlyIncome: null,
+    customCategories: [],
     budgetByCategory: {},
     alertThresholds: DEFAULT_ALERT_THRESHOLDS,
     alertSent: {},
@@ -1186,8 +1237,8 @@ async function deleteTransactionById(user, transactionId) {
   });
 }
 
-function buildEmptyCategoryTotals() {
-  return ALLOWED_CATEGORIES.reduce((accumulator, category) => {
+function buildEmptyCategoryTotals(categories = ALLOWED_CATEGORIES) {
+  return categories.reduce((accumulator, category) => {
     accumulator[category] = 0;
     return accumulator;
   }, {});
@@ -1228,9 +1279,11 @@ async function getMonthlySummaryByUser(user, year, month) {
       continue;
     }
 
-    const category = ALLOWED_CATEGORIES.includes(transaction.categoria)
-      ? transaction.categoria
-      : 'Outros';
+    const category = normalizeCategoryName(transaction.categoria, 'Outros');
+
+    if (!Object.prototype.hasOwnProperty.call(byCategory, category)) {
+      byCategory[category] = 0;
+    }
 
     byCategory[category] = roundTo2(byCategory[category] + value);
 

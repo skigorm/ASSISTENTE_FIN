@@ -21,6 +21,7 @@ const {
   logError,
   logInfo,
   logWarn,
+  normalizeCategoryName,
   normalizeUserId,
   parseDateFromText,
   parseMoney,
@@ -140,6 +141,59 @@ function normalizeCommandText(text) {
   return stripAccents(sanitizeText(text).toLowerCase());
 }
 
+function normalizeCategoryToken(text) {
+  return normalizeCommandText(String(text || '')).replace(/\s+/g, ' ').trim();
+}
+
+function getCustomCategories(profile) {
+  if (!profile || !Array.isArray(profile.customCategories)) {
+    return [];
+  }
+
+  return [...new Set(
+    profile.customCategories
+      .map((item) => normalizeCategoryName(item, ''))
+      .filter(Boolean)
+      .filter((item) => !ALLOWED_CATEGORIES.includes(item))
+  )];
+}
+
+function getAllCategories(profile) {
+  const categories = [...ALLOWED_CATEGORIES];
+
+  for (const custom of getCustomCategories(profile)) {
+    if (!categories.includes(custom)) {
+      categories.push(custom);
+    }
+  }
+
+  return categories;
+}
+
+function findCategoryByText(commandText, categories = []) {
+  const normalizedText = normalizeCategoryToken(commandText);
+
+  for (const category of categories) {
+    const safeCategory = normalizeCategoryName(category, '');
+
+    if (!safeCategory) {
+      continue;
+    }
+
+    const token = normalizeCategoryToken(safeCategory);
+
+    if (!token) {
+      continue;
+    }
+
+    if (normalizedText.includes(token)) {
+      return safeCategory;
+    }
+  }
+
+  return null;
+}
+
 function parseYesNo(text) {
   const normalized = normalizeCommandText(text);
 
@@ -185,7 +239,13 @@ function monthLabelFromIsoDate(isoDate) {
   return `${safeDate.slice(5, 7)}/${safeDate.slice(0, 4)}`;
 }
 
-function parseCategoryFromText(commandText) {
+function parseCategoryFromText(commandText, customCategories = []) {
+  const customMatch = findCategoryByText(commandText, customCategories);
+
+  if (customMatch) {
+    return customMatch;
+  }
+
   if (/\b(alimentacao|mercado|ifood|comida|restaurante|lanche)\b/.test(commandText)) {
     return 'Alimentação';
   }
@@ -301,6 +361,10 @@ function buildHelpMessage() {
     '- editar gasto <id> para 45 no mercado ontem',
     '- desfazer ultimo gasto',
     '- meu perfil',
+    '- categorias | listar categorias',
+    '- criar categoria obra',
+    '- criar categoria água com orçamento 250',
+    '- remover categoria obra',
     '- nome <seu nome>',
     '- renda 5500',
     '- orçamento alimentação 1200',
@@ -327,14 +391,30 @@ function formatSignedCurrency(value) {
   return `-${formatCurrencyBRL(Math.abs(safeValue))}`;
 }
 
+function sortCategoriesForDisplay(summary, profile) {
+  const base = [...ALLOWED_CATEGORIES];
+  const extras = new Set([
+    ...getCustomCategories(profile),
+    ...Object.keys(summary && summary.byCategory ? summary.byCategory : {}).filter(
+      (category) => !ALLOWED_CATEGORIES.includes(category)
+    )
+  ]);
+
+  return [...base, ...[...extras].sort((a, b) => a.localeCompare(b, 'pt-BR'))];
+}
+
 function buildBudgetProgressLines(profile, monthSummary) {
   if (!profile || !profile.budgetByCategory) {
     return [];
   }
 
+  const categories = new Set([
+    ...getAllCategories(profile),
+    ...Object.keys(monthSummary && monthSummary.byCategory ? monthSummary.byCategory : {})
+  ]);
   const lines = [];
 
-  for (const category of ALLOWED_CATEGORIES) {
+  for (const category of categories) {
     const budget = Number(profile.budgetByCategory[category]);
 
     if (!Number.isFinite(budget) || budget <= 0) {
@@ -366,7 +446,7 @@ function buildMonthlySummaryMessage(summary, monthLabel, profile) {
     'Por categoria:'
   ];
 
-  for (const category of ALLOWED_CATEGORIES) {
+  for (const category of sortCategoriesForDisplay(summary, profile)) {
     lines.push(`- ${category}: ${formatCurrencyBRL(summary.byCategory[category] || 0)}`);
   }
 
@@ -506,7 +586,11 @@ function hasMonthlySummaryIntent(commandText) {
     return true;
   }
 
-  if (/^\/?total\s+(alimentacao|transporte|lazer|outros)\b/.test(commandText)) {
+  if (/^\/?total\s+.+\b(mes|m[eê]s)\b/.test(commandText)) {
+    return true;
+  }
+
+  if (/^\/?total\s+\w+/.test(commandText)) {
     return true;
   }
 
@@ -601,7 +685,7 @@ function parseEditIntent(text) {
   };
 }
 
-function parsePatchFromTextFallback(text, referenceDate = new Date()) {
+function parsePatchFromTextFallback(text, referenceDate = new Date(), customCategories = []) {
   const clean = sanitizeText(text);
 
   if (!clean) {
@@ -621,7 +705,7 @@ function parsePatchFromTextFallback(text, referenceDate = new Date()) {
     }
   }
 
-  const category = parseCategoryFromText(normalized);
+  const category = parseCategoryFromText(normalized, customCategories);
 
   if (category) {
     patch.categoria = category;
@@ -646,7 +730,8 @@ function buildProfileMessage(profile) {
     ? `Renda mensal: ${formatCurrencyBRL(Number(profile.monthlyIncome))}`
     : 'Renda mensal: não informada';
 
-  const budgetLines = ALLOWED_CATEGORIES.map((category) => {
+  const categories = getAllCategories(profile);
+  const budgetLines = categories.map((category) => {
     const value = profile.budgetByCategory && Number(profile.budgetByCategory[category]);
 
     if (Number.isFinite(value) && value > 0) {
@@ -665,6 +750,7 @@ function buildProfileMessage(profile) {
     nameLine,
     incomeLine,
     `Alertas de orçamento (saldo restante): ${alertThresholds}`,
+    `Categorias personalizadas: ${getCustomCategories(profile).length ? getCustomCategories(profile).join(', ') : 'nenhuma'}`,
     '',
     'Orçamento por categoria:',
     ...budgetLines
@@ -967,13 +1053,59 @@ async function handleOnboardingFlow(sock, jid, userNumber, text, profile, conver
   return { handled: true, profile };
 }
 
-function parseProfileCommand(commandText, originalText) {
+function parseProfileCommand(commandText, originalText, profile) {
+  const customCategories = getCustomCategories(profile);
+
   if (/^(\/)?(meu perfil|perfil)$/.test(commandText)) {
     return { action: 'show_profile' };
   }
 
+  if (/^(\/)?(categorias|listar categorias)$/.test(commandText)) {
+    return { action: 'list_categories' };
+  }
+
   if (/^(\/)?(reconfigurar perfil|refazer cadastro|cadastro novamente)$/.test(commandText)) {
     return { action: 'restart_onboarding' };
+  }
+
+  const createCategoryMatch = originalText.match(
+    /^(?:\/?(?:criar categoria|nova categoria|adicionar categoria))\s+(.+)$/i
+  );
+
+  if (createCategoryMatch && createCategoryMatch[1]) {
+    const rawCategory = sanitizeText(createCategoryMatch[1]).replace(/\s+(com|c\/)\s+orcamento.+$/i, '').trim();
+    const category = normalizeCategoryName(rawCategory, '');
+    const budgetValue = parseMoney(createCategoryMatch[1]);
+
+    if (!category) {
+      return { action: 'invalid_custom_category_name' };
+    }
+
+    return {
+      action: 'create_category',
+      category,
+      budgetValue: Number.isFinite(budgetValue) && budgetValue > 0 ? Number(budgetValue.toFixed(2)) : null
+    };
+  }
+
+  const removeCategoryMatch = originalText.match(
+    /^(?:\/?(?:remover categoria|excluir categoria|apagar categoria))\s+(.+)$/i
+  );
+
+  if (removeCategoryMatch && removeCategoryMatch[1]) {
+    const category = parseCategoryFromText(
+      normalizeCommandText(removeCategoryMatch[1]),
+      customCategories
+    ) || normalizeCategoryName(removeCategoryMatch[1], '');
+
+    if (!category) {
+      return { action: 'invalid_custom_category_name' };
+    }
+
+    return {
+      action: 'remove_category',
+      category
+    };
   }
 
   const nameMatch = originalText.match(/^(?:\/?(?:nome|alterar nome|me chame de))\s+(.+)$/i);
@@ -1003,7 +1135,7 @@ function parseProfileCommand(commandText, originalText) {
   const clearBudgetMatch = commandText.match(/^(\/)?(limpar orcamento|limpar orçamento|remover orcamento|remover orçamento)\s+(.+)$/);
 
   if (clearBudgetMatch && clearBudgetMatch[3]) {
-    const category = parseCategoryFromText(clearBudgetMatch[3]);
+    const category = parseCategoryFromText(clearBudgetMatch[3], customCategories);
 
     if (!category) {
       return { action: 'invalid_budget_category' };
@@ -1019,22 +1151,37 @@ function parseProfileCommand(commandText, originalText) {
 
   if (budgetMatch && budgetMatch[1]) {
     const budgetText = budgetMatch[1];
-    const category = parseCategoryFromText(normalizeCommandText(budgetText));
+    const value = parseMoney(budgetText);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      return { action: 'invalid_budget_value', category: 'categoria informada' };
+    }
+
+    const valueMatch = budgetText.match(/(\d+[\d.,]*)/);
+    const categoryText = sanitizeText(
+      valueMatch && valueMatch[1]
+        ? budgetText.replace(valueMatch[1], '')
+        : budgetText
+    )
+      .replace(/\b(r\$|reais?|por mes|por mês|mensal|do mes|do mês)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const parsedCategory = parseCategoryFromText(
+      normalizeCommandText(categoryText),
+      customCategories
+    );
+    const category = parsedCategory || normalizeCategoryName(categoryText, '');
 
     if (!category) {
       return { action: 'invalid_budget_category' };
     }
 
-    const value = parseMoney(budgetText);
-
-    if (!Number.isFinite(value) || value <= 0) {
-      return { action: 'invalid_budget_value', category };
-    }
-
     return {
       action: 'set_budget',
       category,
-      value: Number(value.toFixed(2))
+      value: Number(value.toFixed(2)),
+      createIfMissing: !ALLOWED_CATEGORIES.includes(category) && !customCategories.includes(category)
     };
   }
 
@@ -1074,6 +1221,85 @@ async function handleProfileCommand(sock, jid, userNumber, profile, command) {
 
   if (command.action === 'show_profile') {
     await safeReply(sock, jid, buildProfileMessage(profile));
+    return true;
+  }
+
+  if (command.action === 'list_categories') {
+    const base = [...ALLOWED_CATEGORIES];
+    const custom = getCustomCategories(profile);
+    await safeReply(
+      sock,
+      jid,
+      [
+        '🏷️ Categorias disponíveis:',
+        `Base: ${base.join(', ')}`,
+        `Personalizadas: ${custom.length ? custom.join(', ') : 'nenhuma'}`,
+        '',
+        'Para criar: criar categoria obra',
+        'Para criar com orçamento: criar categoria água com orçamento 250'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  if (command.action === 'create_category') {
+    if (ALLOWED_CATEGORIES.includes(command.category)) {
+      await safeReply(sock, jid, `A categoria ${command.category} já existe na base.`);
+      return true;
+    }
+
+    const custom = getCustomCategories(profile);
+
+    if (custom.includes(command.category)) {
+      await safeReply(sock, jid, `A categoria ${command.category} já está cadastrada.`);
+      return true;
+    }
+
+    const patch = {
+      customCategories: [...custom, command.category]
+    };
+
+    if (Number.isFinite(command.budgetValue) && command.budgetValue > 0) {
+      patch.budgetByCategory = {
+        [command.category]: command.budgetValue
+      };
+    }
+
+    await updateUserProfile(userNumber, patch);
+
+    await safeReply(
+      sock,
+      jid,
+      Number.isFinite(command.budgetValue) && command.budgetValue > 0
+        ? `Categoria ${command.category} criada com orçamento mensal de ${formatCurrencyBRL(command.budgetValue)}.`
+        : `Categoria ${command.category} criada com sucesso.`
+    );
+    return true;
+  }
+
+  if (command.action === 'remove_category') {
+    if (ALLOWED_CATEGORIES.includes(command.category)) {
+      await safeReply(sock, jid, `A categoria ${command.category} é padrão e não pode ser removida.`);
+      return true;
+    }
+
+    const custom = getCustomCategories(profile);
+
+    if (!custom.includes(command.category)) {
+      await safeReply(sock, jid, `Não encontrei a categoria personalizada ${command.category}.`);
+      return true;
+    }
+
+    const nextCustom = custom.filter((item) => item !== command.category);
+
+    await updateUserProfile(userNumber, {
+      customCategories: nextCustom,
+      budgetByCategory: {
+        [command.category]: null
+      }
+    });
+
+    await safeReply(sock, jid, `Categoria ${command.category} removida.`);
     return true;
   }
 
@@ -1117,7 +1343,14 @@ async function handleProfileCommand(sock, jid, userNumber, profile, command) {
   }
 
   if (command.action === 'set_budget') {
+    const custom = getCustomCategories(profile);
+    const shouldAddCustom = command.createIfMissing && !ALLOWED_CATEGORIES.includes(command.category);
+    const customCategories = shouldAddCustom
+      ? [...custom, command.category]
+      : custom;
+
     await updateUserProfile(userNumber, {
+      customCategories,
       budgetByCategory: {
         [command.category]: command.value
       }
@@ -1158,12 +1391,26 @@ async function handleProfileCommand(sock, jid, userNumber, profile, command) {
   }
 
   if (command.action === 'invalid_budget_category') {
-    await safeReply(sock, jid, 'Não identifiquei a categoria. Use: alimentação, transporte, lazer ou outros.');
+    await safeReply(
+      sock,
+      jid,
+      [
+        'Não identifiquei a categoria.',
+        'Você pode usar uma categoria base (alimentação, transporte, lazer, outros) ou criar nova:',
+        '- criar categoria obra',
+        '- criar categoria água com orçamento 250'
+      ].join('\n')
+    );
     return true;
   }
 
   if (command.action === 'invalid_budget_value') {
     await safeReply(sock, jid, `Não consegui entender o valor do orçamento de ${command.category}. Exemplo: orçamento ${command.category.toLowerCase()} 1200`);
+    return true;
+  }
+
+  if (command.action === 'invalid_custom_category_name') {
+    await safeReply(sock, jid, 'Nome de categoria inválido. Exemplo: criar categoria dízimo');
     return true;
   }
 
@@ -1200,7 +1447,7 @@ async function tryHandleFinanceSummary(sock, jid, userNumber, text, referenceDat
     return false;
   }
 
-  const requestedCategory = parseCategoryFromText(commandText);
+  const requestedCategory = parseCategoryFromText(commandText, getCustomCategories(profile));
   const resolvedMonth = resolveSummaryMonth(commandText, referenceDate);
   const summary = await getMonthlySummaryByUser(
     userNumber,
@@ -1309,17 +1556,17 @@ async function tryHandleDeleteExpense(sock, jid, userNumber, text) {
   return true;
 }
 
-async function parseUpdatePatch(text, referenceDate) {
-  const aiPatch = await parseTransactionPatchWithAI(text, referenceDate);
+async function parseUpdatePatch(text, referenceDate, customCategories = []) {
+  const aiPatch = await parseTransactionPatchWithAI(text, referenceDate, { customCategories });
 
   if (aiPatch) {
     return aiPatch;
   }
 
-  return parsePatchFromTextFallback(text, referenceDate);
+  return parsePatchFromTextFallback(text, referenceDate, customCategories);
 }
 
-async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate) {
+async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate, profile) {
   const intent = parseEditIntent(text);
 
   if (!intent) {
@@ -1348,7 +1595,7 @@ async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate) 
   }
 
   const updateText = sanitizeText(intent.updateText);
-  const patch = await parseUpdatePatch(updateText, referenceDate);
+  const patch = await parseUpdatePatch(updateText, referenceDate, getCustomCategories(profile));
 
   if (!patch) {
     await safeReply(
@@ -1634,7 +1881,7 @@ async function processIncomingMessage(sock, message) {
       return;
     }
 
-    const profileCommand = parseProfileCommand(commandText, text);
+    const profileCommand = parseProfileCommand(commandText, text, profile);
     const profileCommandHandled = await handleProfileCommand(sock, jid, userNumber, profile, profileCommand);
 
     if (profileCommandHandled) {
@@ -1666,13 +1913,16 @@ async function processIncomingMessage(sock, message) {
       return;
     }
 
-    const editHandled = await tryHandleEditExpense(sock, jid, userNumber, text, referenceDate);
+    const editHandled = await tryHandleEditExpense(sock, jid, userNumber, text, referenceDate, profile);
 
     if (editHandled) {
       return;
     }
 
-    let transaction = await parseTransactionWithAI(text, referenceDate);
+    const customCategories = getCustomCategories(profile);
+    let transaction = await parseTransactionWithAI(text, referenceDate, {
+      customCategories
+    });
 
     if (!transaction) {
       if (isLikelyPromotionalText(text)) {
@@ -1683,7 +1933,9 @@ async function processIncomingMessage(sock, message) {
         return;
       }
 
-      transaction = fallbackParseTransaction(text, referenceDate);
+      transaction = fallbackParseTransaction(text, referenceDate, {
+        customCategories
+      });
 
       if (transaction) {
         logInfo('WHATSAPP', 'Mensagem interpretada com fallback local.', {
@@ -1706,6 +1958,12 @@ async function processIncomingMessage(sock, message) {
         ].join('\n')
       );
       return;
+    }
+
+    const explicitCategory = parseCategoryFromText(commandText, customCategories);
+
+    if (explicitCategory) {
+      transaction.categoria = normalizeCategoryName(explicitCategory, transaction.categoria || 'Outros');
     }
 
     const saveResult = await saveTransaction(userNumber, transaction);
