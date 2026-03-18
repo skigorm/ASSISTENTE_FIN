@@ -8,10 +8,22 @@ const { BufferJSON, initAuthCreds, proto, useMultiFileAuthState } = baileys;
 const AUTH_FOLDER = path.join(__dirname, '..', 'data', 'baileys_auth');
 const REDIS_AUTH_PREFIX_ENV = 'WHATSAPP_AUTH_PREFIX';
 const DEFAULT_REDIS_AUTH_PREFIX = 'finance-bot:baileys-auth';
+const REDIS_TLS_ENV = 'REDIS_TLS';
+const REDIS_TLS_REJECT_UNAUTHORIZED_ENV = 'REDIS_TLS_REJECT_UNAUTHORIZED';
 
 function getRedisAuthPrefix() {
   const customPrefix = String(process.env[REDIS_AUTH_PREFIX_ENV] || '').trim();
   return customPrefix || DEFAULT_REDIS_AUTH_PREFIX;
+}
+
+function isEnvEnabled(name, defaultValue = false) {
+  const value = String(process.env[name] || '').trim().toLowerCase();
+
+  if (!value) {
+    return defaultValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(value);
 }
 
 function fixKeyName(name) {
@@ -25,15 +37,31 @@ function buildRedisKey(prefix, name) {
 }
 
 async function useRedisAuthState(redisUrl, prefix) {
+  const useTls = isEnvEnabled(REDIS_TLS_ENV, redisUrl.startsWith('rediss://'));
+  const tlsRejectUnauthorized = isEnvEnabled(REDIS_TLS_REJECT_UNAUTHORIZED_ENV, false);
+  let errorAlreadyLogged = false;
+
   const client = createClient({
     url: redisUrl,
     socket: {
-      connectTimeout: 10000
+      connectTimeout: 10000,
+      tls: useTls,
+      rejectUnauthorized: tlsRejectUnauthorized,
+      reconnectStrategy: (retries) => {
+        if (retries >= 3) {
+          return new Error('Redis auth indisponível após tentativas de conexão.');
+        }
+
+        return Math.min((retries + 1) * 200, 1000);
+      }
     }
   });
 
   client.on('error', (error) => {
-    logError('AUTH', 'Erro no cliente Redis de autenticação.', error.message);
+    if (!errorAlreadyLogged) {
+      errorAlreadyLogged = true;
+      logError('AUTH', 'Erro no cliente Redis de autenticação.', error.message);
+    }
   });
 
   await client.connect();

@@ -46,6 +46,8 @@ Use em conversa privada com o bot:
 - `WHATSAPP_PAIRING_NUMBER`: número fixo para gerar código de pareamento (com DDI, só dígitos)
 - `REDIS_URL`: URL do Heroku Redis (injetada automaticamente pelo add-on)
 - `WHATSAPP_AUTH_PREFIX`: prefixo das chaves de sessão no Redis
+- `REDIS_TLS`: habilita TLS no cliente Redis (`true` no Heroku)
+- `REDIS_TLS_REJECT_UNAUTHORIZED`: validação de certificado TLS (`false` para Heroku Redis self-signed)
 
 ## 🔐 Pareamento com Número Fixo
 
