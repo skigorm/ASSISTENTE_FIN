@@ -2,6 +2,7 @@
 
 Bot financeiro para WhatsApp com:
 - registro de gastos por linguagem natural
+- leitura de comprovante por foto (imagem)
 - onboarding de novos usuários
 - perfil financeiro (nome, renda, orçamento por categoria)
 - categorias personalizadas (ex: obra, dízimo, água, luz, alarme)
@@ -17,6 +18,12 @@ Bot financeiro para WhatsApp com:
 4. Salva transação com ID.
 5. Responde com confirmação natural + resumo do mês.
 6. Dispara alerta se orçamento por categoria estiver perto de acabar.
+
+Também aceita foto de comprovante:
+1. Usuário envia imagem (com ou sem legenda).
+2. O bot extrai valor/categoria/descrição/data via OpenAI.
+3. Mostra prévia e pergunta: `Deseja salvar esse gasto? (sim/não)`.
+4. Usuário confirma (`sim`) ou corrige em texto (`valor 45 categoria alimentação`) antes de salvar.
 
 ## Fluxo de primeiro uso (onboarding)
 
@@ -63,6 +70,7 @@ Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 - `limpar orçamento alimentação`
 - `alertas 10 20 30`
 - `reconfigurar perfil`
+- enviar foto do comprovante + responder `sim` para salvar
 
 ## Pareamento (código, sem QR)
 
@@ -79,6 +87,7 @@ Use `.env.example` como base:
 
 - `OPENAI_KEY=...`
 - `OPENAI_MODEL=gpt-4o-mini` (opcional)
+- `OPENAI_VISION_MODEL=gpt-4o-mini` (opcional, para leitura de comprovante por imagem)
 - `WHATSAPP_PAIRING_NUMBER=55619...`
 - `DISABLE_WHATSAPP_BOT=false`
 - `WHATSAPP_LOG_MESSAGES=true`

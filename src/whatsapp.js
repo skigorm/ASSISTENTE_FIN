@@ -1,5 +1,9 @@
 const { loadWhatsAppAuthState } = require('./auth');
-const { parseTransactionPatchWithAI, parseTransactionWithAI } = require('./ai');
+const {
+  parseReceiptWithAI,
+  parseTransactionPatchWithAI,
+  parseTransactionWithAI
+} = require('./ai');
 const {
   DEFAULT_ALERT_THRESHOLDS,
   clearConversationState,
@@ -78,6 +82,7 @@ async function getBaileysRuntime() {
               : null;
         const DisconnectReason = runtime.DisconnectReason || fallback.DisconnectReason || {};
         const fetchLatestBaileysVersion = runtime.fetchLatestBaileysVersion || fallback.fetchLatestBaileysVersion;
+        const downloadMediaMessage = runtime.downloadMediaMessage || fallback.downloadMediaMessage;
 
         if (typeof makeWASocket !== 'function') {
           throw new Error('Baileys runtime inválido: makeWASocket não encontrado.');
@@ -86,7 +91,8 @@ async function getBaileysRuntime() {
         return {
           makeWASocket,
           DisconnectReason,
-          fetchLatestBaileysVersion
+          fetchLatestBaileysVersion,
+          downloadMediaMessage
         };
       })
       .catch((error) => {
@@ -318,6 +324,66 @@ function extractTextMessage(messageContent) {
   }
 
   return '';
+}
+
+function extractImageMessage(messageContent) {
+  const content = unwrapMessageContent(messageContent);
+
+  if (!content) {
+    return null;
+  }
+
+  if (content.imageMessage) {
+    return content.imageMessage;
+  }
+
+  if (
+    content.documentMessage &&
+    typeof content.documentMessage.mimetype === 'string' &&
+    content.documentMessage.mimetype.startsWith('image/')
+  ) {
+    return content.documentMessage;
+  }
+
+  return null;
+}
+
+async function downloadImageBuffer(sock, message) {
+  try {
+    const { downloadMediaMessage } = await getBaileysRuntime();
+
+    if (typeof downloadMediaMessage !== 'function') {
+      logWarn('WHATSAPP', 'downloadMediaMessage indisponível no runtime do Baileys.');
+      return null;
+    }
+
+    const content = await downloadMediaMessage(
+      message,
+      'buffer',
+      {},
+      {
+        logger: silentBaileysLogger,
+        reuploadRequest: sock.updateMediaMessage
+      }
+    );
+
+    if (!content) {
+      return null;
+    }
+
+    if (Buffer.isBuffer(content)) {
+      return content;
+    }
+
+    if (content instanceof Uint8Array) {
+      return Buffer.from(content);
+    }
+
+    return null;
+  } catch (error) {
+    logError('WHATSAPP', 'Falha ao baixar imagem da mensagem.', error.message);
+    return null;
+  }
 }
 
 async function safeReply(sock, jid, text) {
@@ -1635,6 +1701,149 @@ async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate, 
   return true;
 }
 
+async function handleReceiptConfirmationFlow(sock, jid, userNumber, text, referenceDate, profile, conversationState) {
+  if (!conversationState || conversationState.step !== 'receipt_confirm') {
+    return false;
+  }
+
+  const pending = conversationState.data && conversationState.data.transaction;
+
+  if (!pending || typeof pending !== 'object') {
+    await clearConversationState(userNumber);
+    return false;
+  }
+
+  const yesNo = parseYesNo(text);
+
+  if (yesNo === true) {
+    await clearConversationState(userNumber);
+
+    const saveResult = await saveTransaction(userNumber, pending);
+
+    if (saveResult.duplicate) {
+      await safeReply(sock, jid, 'Esse gasto já tinha sido registrado.');
+      return true;
+    }
+
+    await notifySavedTransaction(sock, jid, userNumber, profile, saveResult.record);
+    return true;
+  }
+
+  if (yesNo === false) {
+    await clearConversationState(userNumber);
+    await safeReply(
+      sock,
+      jid,
+      [
+        'Certo, não salvei esse comprovante.',
+        'Pode mandar outra foto ou escrever o gasto em texto.'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  const patch = await parseUpdatePatch(text, referenceDate, getCustomCategories(profile));
+
+  if (!patch) {
+    await safeReply(
+      sock,
+      jid,
+      'Me responde com *sim* ou *não*. Se quiser ajustar, pode escrever: "valor 45 categoria alimentação".'
+    );
+    return true;
+  }
+
+  const adjusted = {
+    ...pending,
+    ...patch
+  };
+
+  await setConversationState(
+    userNumber,
+    {
+      step: 'receipt_confirm',
+      data: {
+        transaction: adjusted,
+        confidence: conversationState.data && conversationState.data.confidence
+      }
+    },
+    CONVERSATION_STATE_TTL_SECONDS
+  );
+
+  await safeReply(
+    sock,
+    jid,
+    [
+      'Atualizei os dados do comprovante:',
+      `• Valor: ${formatCurrencyBRL(adjusted.valor)}`,
+      `• Categoria: ${adjusted.categoria}`,
+      `• Descrição: ${adjusted.descricao}`,
+      `• Data: ${formatDateBR(adjusted.data)}`,
+      '',
+      'Salvar agora? (sim/não)'
+    ].join('\n')
+  );
+  return true;
+}
+
+async function tryHandleReceiptImage(sock, jid, userNumber, message, imageMessage, text, referenceDate, profile) {
+  if (!imageMessage) {
+    return false;
+  }
+
+  const imageBuffer = await downloadImageBuffer(sock, message);
+
+  if (!imageBuffer || imageBuffer.length === 0) {
+    await safeReply(
+      sock,
+      jid,
+      'Não consegui baixar sua foto. Tenta enviar novamente, por favor.'
+    );
+    return true;
+  }
+
+  const customCategories = getCustomCategories(profile);
+  const mimeType = sanitizeText(imageMessage.mimetype || 'image/jpeg');
+  const receiptResult = await parseReceiptWithAI(
+    imageBuffer,
+    mimeType,
+    text,
+    referenceDate,
+    { customCategories }
+  );
+
+  if (!receiptResult || !receiptResult.transaction) {
+    if (text) {
+      return false;
+    }
+
+    await safeReply(
+      sock,
+      jid,
+      [
+        'Não consegui identificar os dados do comprovante.',
+        'Tente uma foto mais nítida e com o valor visível.'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  await setConversationState(
+    userNumber,
+    {
+      step: 'receipt_confirm',
+      data: {
+        transaction: receiptResult.transaction,
+        confidence: receiptResult.confidence
+      }
+    },
+    CONVERSATION_STATE_TTL_SECONDS
+  );
+
+  await safeReply(sock, jid, buildReceiptConfirmationMessage(receiptResult));
+  return true;
+}
+
 function buildNaturalSuccessMessage(profile, transaction, monthSummary) {
   const hasName = profile && profile.name;
   const openers = hasName
@@ -1667,6 +1876,50 @@ function buildNaturalSuccessMessage(profile, transaction, monthSummary) {
     '',
     `Se precisar corrigir: "editar gasto ${transaction.id} para 45 no mercado".`
   ].join('\n');
+}
+
+function buildReceiptConfirmationMessage(receiptResult) {
+  if (!receiptResult || !receiptResult.transaction) {
+    return [
+      'Não consegui extrair os dados do comprovante.',
+      'Tente enviar uma foto mais nítida e com o valor visível.'
+    ].join('\n');
+  }
+
+  const { transaction, confidence, estabelecimento } = receiptResult;
+  const confidenceLabel = Number.isFinite(confidence)
+    ? `${Math.round(confidence * 100)}%`
+    : 'não informado';
+  const storeLabel = sanitizeText(estabelecimento || transaction.descricao || '');
+
+  return [
+    '🧾 Li seu comprovante e encontrei:',
+    `• Valor: ${formatCurrencyBRL(transaction.valor)}`,
+    `• Categoria: ${transaction.categoria}`,
+    `• Descrição: ${transaction.descricao}`,
+    `• Data: ${formatDateBR(transaction.data)}`,
+    storeLabel ? `• Estabelecimento: ${storeLabel}` : null,
+    `• Confiança: ${confidenceLabel}`,
+    '',
+    'Deseja salvar esse gasto? (sim/não)'
+  ].filter(Boolean).join('\n');
+}
+
+async function notifySavedTransaction(sock, jid, userNumber, profile, record) {
+  const transactionDate = sanitizeText(record.data);
+  const summaryYear = Number.parseInt(transactionDate.slice(0, 4), 10);
+  const summaryMonth = Number.parseInt(transactionDate.slice(5, 7), 10);
+  const monthSummary = await getMonthlySummaryByUser(userNumber, summaryYear, summaryMonth);
+
+  await safeReply(sock, jid, buildNaturalSuccessMessage(profile, record, monthSummary));
+
+  const refreshedProfile = await getUserProfile(userNumber);
+  const budgetAlert = evaluateBudgetAlert(refreshedProfile, monthSummary, record);
+
+  if (budgetAlert) {
+    await updateUserProfile(userNumber, budgetAlert.profilePatch);
+    await safeReply(sock, jid, budgetAlert.message);
+  }
 }
 
 function evaluateBudgetAlert(profile, monthSummary, transaction) {
@@ -1814,19 +2067,16 @@ async function processIncomingMessage(sock, message) {
     }
 
     const rawText = extractTextMessage(message.message);
+    const imageMessage = extractImageMessage(message.message);
 
-    if (!rawText) {
+    if (!rawText && !imageMessage) {
       if (shouldLogIgnoredMessages()) {
-        logInfo('WHATSAPP', 'Mensagem ignorada (não é texto).', { jid });
+        logInfo('WHATSAPP', 'Mensagem ignorada (tipo não suportado).', { jid });
       }
       return;
     }
 
     const text = sanitizeText(rawText);
-
-    if (!text) {
-      return;
-    }
 
     const userNumber = normalizeUserId(jid);
 
@@ -1834,7 +2084,8 @@ async function processIncomingMessage(sock, message) {
       logInfo('WHATSAPP', 'Mensagem recebida.', {
         jid,
         user: userNumber,
-        text
+        text: text || '(sem texto)',
+        hasImage: Boolean(imageMessage)
       });
     }
 
@@ -1862,6 +2113,22 @@ async function processIncomingMessage(sock, message) {
     }
 
     profile = onboardingResult.profile || profile;
+
+    if (!imageMessage && text) {
+      const receiptConfirmationHandled = await handleReceiptConfirmationFlow(
+        sock,
+        jid,
+        userNumber,
+        text,
+        referenceDate,
+        profile,
+        conversationState
+      );
+
+      if (receiptConfirmationHandled) {
+        return;
+      }
+    }
 
     if (isHelpCommand(commandText)) {
       await safeReply(sock, jid, buildHelpMessage());
@@ -1916,6 +2183,27 @@ async function processIncomingMessage(sock, message) {
     const editHandled = await tryHandleEditExpense(sock, jid, userNumber, text, referenceDate, profile);
 
     if (editHandled) {
+      return;
+    }
+
+    if (imageMessage) {
+      const receiptHandled = await tryHandleReceiptImage(
+        sock,
+        jid,
+        userNumber,
+        message,
+        imageMessage,
+        text,
+        referenceDate,
+        profile
+      );
+
+      if (receiptHandled) {
+        return;
+      }
+    }
+
+    if (!text) {
       return;
     }
 
@@ -1974,20 +2262,7 @@ async function processIncomingMessage(sock, message) {
       return;
     }
 
-    const transactionDate = sanitizeText(saveResult.record.data);
-    const summaryYear = Number.parseInt(transactionDate.slice(0, 4), 10);
-    const summaryMonth = Number.parseInt(transactionDate.slice(5, 7), 10);
-
-    const monthSummary = await getMonthlySummaryByUser(userNumber, summaryYear, summaryMonth);
-    await safeReply(sock, jid, buildNaturalSuccessMessage(profile, saveResult.record, monthSummary));
-
-    const refreshedProfile = await getUserProfile(userNumber);
-    const budgetAlert = evaluateBudgetAlert(refreshedProfile, monthSummary, saveResult.record);
-
-    if (budgetAlert) {
-      await updateUserProfile(userNumber, budgetAlert.profilePatch);
-      await safeReply(sock, jid, budgetAlert.message);
-    }
+    await notifySavedTransaction(sock, jid, userNumber, profile, saveResult.record);
 
     logInfo('WHATSAPP', 'Transação processada com sucesso.', saveResult.record);
   } catch (error) {

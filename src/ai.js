@@ -1,5 +1,9 @@
 const axios = require('axios');
-const { buildExtractionSystemPrompt, buildUpdateSystemPrompt } = require('./prompt');
+const {
+  buildExtractionSystemPrompt,
+  buildReceiptSystemPrompt,
+  buildUpdateSystemPrompt
+} = require('./prompt');
 const {
   extractJSONObject,
   logError,
@@ -35,29 +39,38 @@ function parseModelOutput(content) {
   return extracted ? safeJsonParse(extracted) : null;
 }
 
-async function callOpenAIJson(messages) {
+async function callOpenAIJson(messages, options = {}) {
   if (!process.env.OPENAI_KEY) {
     logWarn('AI', 'OPENAI_KEY não configurada. Usando fallback local.');
     return null;
   }
 
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const model = sanitizeText(options.model || process.env.OPENAI_MODEL || 'gpt-4o-mini');
+  const timeout = Number.isFinite(Number(options.timeout)) && Number(options.timeout) > 0
+    ? Number(options.timeout)
+    : 20000;
+
+  const payload = {
+    model,
+    temperature: 0,
+    response_format: { type: 'json_object' },
+    messages
+  };
+
+  if (Number.isFinite(Number(options.maxTokens)) && Number(options.maxTokens) > 0) {
+    payload.max_tokens = Number(options.maxTokens);
+  }
 
   try {
     const response = await axios.post(
       OPENAI_URL,
-      {
-        model,
-        temperature: 0,
-        response_format: { type: 'json_object' },
-        messages
-      },
+      payload,
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENAI_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 20000
+        timeout
       }
     );
 
@@ -85,6 +98,34 @@ async function callOpenAIJson(messages) {
     });
     return null;
   }
+}
+
+function normalizeConfidence(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(String(value).replace(',', '.'));
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  let normalized = parsed;
+
+  if (normalized > 1 && normalized <= 100) {
+    normalized = normalized / 100;
+  }
+
+  if (normalized > 1) {
+    normalized = 1;
+  }
+
+  if (normalized < 0) {
+    normalized = 0;
+  }
+
+  return Number(normalized.toFixed(2));
 }
 
 async function parseTransactionWithAI(text, referenceDate = new Date(), options = {}) {
@@ -175,7 +216,96 @@ async function parseTransactionPatchWithAI(text, referenceDate = new Date(), opt
   return Object.keys(patch).length ? patch : null;
 }
 
+async function parseReceiptWithAI(
+  imageBuffer,
+  mimeType = 'image/jpeg',
+  caption = '',
+  referenceDate = new Date(),
+  options = {}
+) {
+  if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+    return null;
+  }
+
+  const customCategories = Array.isArray(options.customCategories) ? options.customCategories : [];
+  const safeMimeType = sanitizeText(String(mimeType || '')).toLowerCase();
+  const finalMimeType = /^image\/[a-z0-9.+-]+$/.test(safeMimeType) ? safeMimeType : 'image/jpeg';
+  const base64Image = imageBuffer.toString('base64');
+
+  if (!base64Image) {
+    return null;
+  }
+
+  const referenceDateISO = toISODate(referenceDate);
+  const cleanCaption = sanitizeText(caption);
+  const visionModel = sanitizeText(process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini');
+  const userText = cleanCaption
+    ? `Legenda enviada junto com a imagem: "${cleanCaption}".`
+    : 'Sem legenda adicional.';
+
+  const parsed = await callOpenAIJson(
+    [
+      {
+        role: 'system',
+        content: buildReceiptSystemPrompt(referenceDateISO, customCategories)
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: userText
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${finalMimeType};base64,${base64Image}`,
+              detail: 'auto'
+            }
+          }
+        ]
+      }
+    ],
+    {
+      model: visionModel,
+      timeout: 35000,
+      maxTokens: 500
+    }
+  );
+
+  if (!parsed || typeof parsed !== 'object') {
+    return null;
+  }
+
+  const normalized = normalizeTransaction(parsed, referenceDate, { customCategories });
+
+  if (!normalized.valid) {
+    logWarn('AI', 'Comprovante inválido após normalização.', normalized.errors);
+    return null;
+  }
+
+  const rawConfidenceCandidates = [
+    parsed.confianca,
+    parsed.confianca_modelo,
+    parsed.confidence,
+    parsed.probabilidade
+  ];
+  const rawConfidence = rawConfidenceCandidates.find((item) => item !== null && item !== undefined);
+  const confidence = normalizeConfidence(rawConfidence);
+  const estabelecimento = sanitizeText(
+    String(parsed.estabelecimento || parsed.loja || parsed.merchant || '')
+  );
+
+  logInfo('AI', 'Comprovante interpretado com sucesso pela OpenAI.');
+  return {
+    transaction: normalized.data,
+    estabelecimento,
+    confidence
+  };
+}
+
 module.exports = {
+  parseReceiptWithAI,
   parseTransactionPatchWithAI,
   parseTransactionWithAI
 };
