@@ -6,8 +6,9 @@ Bot financeiro para WhatsApp com:
 - onboarding de novos usuários
 - perfil financeiro (nome, renda, orçamento por categoria)
 - categorias personalizadas (ex: obra, dízimo, água, luz, alarme)
-- alertas de orçamento
+- alertas de consumo automáticos
 - edição e remoção de despesas
+- painel de administração para habilitar/desabilitar acesso por usuário
 - persistência em Redis (Heroku) com fallback em arquivo
 
 ## Como funciona
@@ -17,7 +18,7 @@ Bot financeiro para WhatsApp com:
 3. Se a OpenAI falhar, usa fallback local por regex.
 4. Salva transação com ID.
 5. Responde com confirmação natural + resumo do mês.
-6. Dispara alerta se orçamento por categoria estiver perto de acabar.
+6. Dispara alertas automáticos de consumo a cada 10% (total do mês e por categoria).
 
 Também aceita foto de comprovante:
 1. Usuário envia imagem (com ou sem legenda).
@@ -40,7 +41,7 @@ Categorias padrão:
 
 Você pode criar categorias novas a qualquer momento.
 
-Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
+Alertas de consumo são automáticos em faixas de `10% 20% ... 100%`, no total do mês e por categoria.
 
 ## Comandos principais (WhatsApp)
 
@@ -68,7 +69,7 @@ Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 - `criar categoria água com orçamento 250`
 - `remover categoria obra`
 - `limpar orçamento alimentação`
-- `alertas 10 20 30`
+- `alertas` (mostra como funcionam os alertas automáticos)
 - `reconfigurar perfil`
 - enviar foto do comprovante + responder `sim` para salvar
 
@@ -80,6 +81,17 @@ Também salva alertas de orçamento (padrão: `10% 20% 30%` de saldo restante).
 4. No celular do número do WhatsApp:
    - WhatsApp → Dispositivos conectados → Conectar com número de telefone
    - cole o código.
+
+## Painel de administração (acesso de usuário)
+
+1. Configure as variáveis:
+   - `ADMIN_PANEL_USERNAME=admin` (ou outro usuário)
+   - `ADMIN_PANEL_PASSWORD=<senha forte>`
+2. Abra `https://SEU-APP.herokuapp.com/admin`
+3. Faça login (Basic Auth do navegador).
+4. No painel, clique em **Habilitar** ou **Desabilitar** para cada usuário.
+
+Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 
 ## Variáveis de ambiente
 
@@ -97,6 +109,8 @@ Use `.env.example` como base:
 - `WHATSAPP_DATA_PREFIX=finance-bot:transactions`
 - `REDIS_TLS=true`
 - `REDIS_TLS_REJECT_UNAUTHORIZED=false`
+- `ADMIN_PANEL_USERNAME=admin`
+- `ADMIN_PANEL_PASSWORD=...` (obrigatória para ativar `/admin`)
 
 ## Persistência de dados
 
@@ -138,6 +152,9 @@ App HTTP:
 - `GET /health` -> `{ "ok": true, "service": "finance-bot" }`
 - `GET /pairing` -> página de pareamento
 - `GET /pairing/status` -> status do WhatsApp
+- `GET /admin` -> painel de gestão de usuários (com autenticação)
+- `GET /admin/api/users` -> lista usuários para o painel
+- `POST /admin/api/users/:user/access` -> habilita/desabilita acesso
 
 ## Deploy Heroku
 

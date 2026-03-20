@@ -270,6 +270,7 @@ function normalizeUserProfileRecord(user, profile = {}) {
   return {
     user: safeUser,
     name: sanitizeText(profile.name).slice(0, 80),
+    accessEnabled: profile.accessEnabled !== false,
     monthlyIncome: Number.isFinite(monthlyIncome) && monthlyIncome > 0 ? roundTo2(monthlyIncome) : null,
     customCategories,
     budgetByCategory: normalizeBudgetByCategory(profile.budgetByCategory, customCategories),
@@ -307,6 +308,7 @@ function normalizeConversationStateRecord(state) {
 function buildDefaultProfile(user) {
   return normalizeUserProfileRecord(user, {
     name: '',
+    accessEnabled: true,
     monthlyIncome: null,
     customCategories: [],
     budgetByCategory: {},
@@ -1334,6 +1336,114 @@ async function getUserProfile(user) {
   return getUserProfileFromFile(safeUser);
 }
 
+function sortProfilesForAdmin(list = []) {
+  return [...list].sort((left, right) => {
+    const leftRef = sanitizeText(left.lastInteractionAt || left.updatedAt || left.createdAt || '');
+    const rightRef = sanitizeText(right.lastInteractionAt || right.updatedAt || right.createdAt || '');
+
+    if (leftRef !== rightRef) {
+      return rightRef.localeCompare(leftRef);
+    }
+
+    return sanitizeText(left.user).localeCompare(sanitizeText(right.user));
+  });
+}
+
+async function listUserProfilesFromFile() {
+  const usersData = await readUsersDataFromFile({ persistNormalized: true });
+  return sortProfilesForAdmin(Object.values(usersData.profiles || {}));
+}
+
+async function scanRedisKeysByPattern(client, pattern) {
+  const keys = [];
+  let cursor = '0';
+
+  do {
+    const result = await client.scan(cursor, {
+      MATCH: pattern,
+      COUNT: 200
+    });
+
+    let nextCursor = '0';
+    let batchKeys = [];
+
+    if (Array.isArray(result)) {
+      nextCursor = String(result[0] || '0');
+      batchKeys = Array.isArray(result[1]) ? result[1] : [];
+    } else if (result && typeof result === 'object') {
+      nextCursor = String(result.cursor || '0');
+      batchKeys = Array.isArray(result.keys) ? result.keys : [];
+    }
+
+    keys.push(...batchKeys);
+    cursor = nextCursor;
+  } while (cursor !== '0');
+
+  return [...new Set(keys)];
+}
+
+async function listUserProfilesFromRedis(client) {
+  const prefix = getRedisDataPrefix();
+  const profilePrefix = `${prefix}:profile:`;
+  const keys = await scanRedisKeysByPattern(client, `${profilePrefix}*`);
+
+  if (!keys.length) {
+    return [];
+  }
+
+  const rawProfiles = await Promise.all(keys.map((key) => client.get(key)));
+  const result = [];
+
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = sanitizeText(keys[index]);
+    const raw = rawProfiles[index];
+    const user = sanitizeText(key.slice(profilePrefix.length));
+
+    if (!user || !raw) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(raw);
+      const normalized = normalizeUserProfileRecord(user, parsed);
+
+      if (normalized) {
+        result.push(normalized);
+      }
+    } catch (_error) {
+      // noop: ignora perfil corrompido
+    }
+  }
+
+  return sortProfilesForAdmin(result);
+}
+
+async function listUserProfiles() {
+  try {
+    const redis = await getRedisClient();
+
+    if (redis) {
+      return await listUserProfilesFromRedis(redis);
+    }
+  } catch (error) {
+    logWarn('STORAGE', 'Falha ao listar perfis no Redis. Usando fallback em arquivo.', error.message);
+  }
+
+  return listUserProfilesFromFile();
+}
+
+async function setUserAccessEnabled(user, enabled) {
+  const safeUser = sanitizeText(user);
+
+  if (!safeUser) {
+    return null;
+  }
+
+  return updateUserProfile(safeUser, {
+    accessEnabled: Boolean(enabled)
+  });
+}
+
 async function updateUserProfile(user, patchInput) {
   const safeUser = sanitizeText(user);
 
@@ -1446,8 +1556,10 @@ module.exports = {
   getRecentTransactionsByUser,
   getTransactionsByUser,
   getUserProfile,
+  listUserProfiles,
   readAllTransactions,
   saveTransaction,
+  setUserAccessEnabled,
   setConversationState,
   updateTransactionById,
   updateUserProfile

@@ -5,7 +5,6 @@ const {
   parseTransactionWithAI
 } = require('./ai');
 const {
-  DEFAULT_ALERT_THRESHOLDS,
   clearConversationState,
   deleteTransactionById,
   getConversationState,
@@ -42,11 +41,16 @@ const {
 
 const RECONNECT_DELAY_MS = 5000;
 const CONVERSATION_STATE_TTL_SECONDS = 24 * 60 * 60;
+const ALERT_CONSUMPTION_THRESHOLDS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 const FRIENDLY_SUPPORT_MESSAGE = [
   'Desculpe, não consegui processar sua mensagem agora.',
   'Por favor, entre em contato com o administrador para suporte.'
+].join(' ');
+const ACCESS_DISABLED_MESSAGE = [
+  'Seu acesso ao assistente está desativado no momento.',
+  'Fale com o administrador para reativar.'
 ].join(' ');
 
 const silentBaileysLogger = {
@@ -383,19 +387,34 @@ async function safeReply(sock, jid, text) {
 
 function buildHelpMessage() {
   return [
-    'Comandos disponíveis:',
+    'Como usar o assistente:',
+    '',
+    '1) Registrar gasto por texto',
+    '- gastei 45 no mercado',
+    '- paguei 39 no uber hoje',
+    '',
+    '2) Registrar gasto por foto',
+    '- envie a foto da despesa/comprovante',
+    '- opcional: envie legenda para ajudar (ex: "valor 45 categoria alimentação hoje")',
+    '',
+    '3) Consultar seus números',
     '- resumo do mes',
+    '- resumo 03/2026',
     '- total por categoria',
     '- total alimentação no mes',
-    '- resumo 03/2026',
     '- como estao minhas contas',
     '- orçamento do mes',
     '- saldo do mes',
     '- listar gastos',
     '- listar gastos 20',
-    '- remover gasto <id> | remover ultimo gasto',
+    '',
+    '4) Ajustar lançamentos',
+    '- remover gasto <id>',
+    '- remover ultimo gasto',
     '- editar gasto <id> para 45 no mercado ontem',
     '- desfazer ultimo gasto',
+    '',
+    '5) Perfil, categorias e orçamento',
     '- meu perfil',
     '- categorias | listar categorias',
     '- criar categoria obra',
@@ -405,12 +424,40 @@ function buildHelpMessage() {
     '- renda 5500',
     '- orçamento alimentação 1200',
     '- limpar orçamento alimentação',
-    '- alertas 10 20 30',
+    '- alertas',
     '',
-    'Para registrar gasto, envie uma mensagem natural, ex:',
-    'gastei 45 no mercado',
-    'paguei 39 no uber hoje'
+    'Sempre que precisar, envie: ajuda'
   ].join('\n');
+}
+
+function formatAlertThresholdsLabel() {
+  return ALERT_CONSUMPTION_THRESHOLDS.join('% / ') + '%';
+}
+
+function resolveTotalBudgetForAlerts(profile) {
+  if (!profile) {
+    return Number.NaN;
+  }
+
+  const categoryBudgets = profile.budgetByCategory && typeof profile.budgetByCategory === 'object'
+    ? Object.values(profile.budgetByCategory)
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+
+  const totalByCategories = categoryBudgets.reduce((sum, value) => sum + value, 0);
+
+  if (totalByCategories > 0) {
+    return Number(totalByCategories.toFixed(2));
+  }
+
+  const monthlyIncome = Number(profile.monthlyIncome);
+
+  if (Number.isFinite(monthlyIncome) && monthlyIncome > 0) {
+    return Number(monthlyIncome.toFixed(2));
+  }
+
+  return Number.NaN;
 }
 
 function formatSignedCurrency(value) {
@@ -777,15 +824,11 @@ function buildProfileMessage(profile) {
     return `- ${category}: não definido`;
   });
 
-  const alertThresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
-    ? profile.alertThresholds.join('% / ') + '%'
-    : DEFAULT_ALERT_THRESHOLDS.join('% / ') + '%';
-
   return [
     '👤 Seu perfil financeiro:',
     nameLine,
     incomeLine,
-    `Alertas de orçamento (saldo restante): ${alertThresholds}`,
+    `Alertas automáticos de consumo: ${formatAlertThresholdsLabel()} (total e por categoria)`,
     `Categorias personalizadas: ${getCustomCategories(profile).length ? getCustomCategories(profile).join(', ') : 'nenhuma'}`,
     '',
     'Orçamento por categoria:',
@@ -815,9 +858,6 @@ function buildRecentExpensesMessage(list) {
 }
 
 function buildOnboardingSummary(profile) {
-  const thresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
-    ? profile.alertThresholds.join('% / ') + '%'
-    : DEFAULT_ALERT_THRESHOLDS.join('% / ') + '%';
   const lines = [
     '✅ Cadastro concluído!',
     profile.name ? `Prazer, ${profile.name}!` : 'Prazer em te ajudar!',
@@ -842,7 +882,7 @@ function buildOnboardingSummary(profile) {
     lines.push('Você ainda não definiu orçamento por categoria.');
   }
 
-  lines.push(`Alertas de orçamento (saldo restante): ${thresholds}`);
+  lines.push(`Alertas automáticos de consumo: ${formatAlertThresholdsLabel()} (total e por categoria).`);
 
   lines.push('');
   lines.push('Agora você já pode mandar gastos normalmente.');
@@ -1221,30 +1261,8 @@ function parseProfileCommand(commandText, originalText, profile) {
     };
   }
 
-  const alertsMatch = originalText.match(/^(?:\/?(?:alertas|alerta))\s+(.+)$/i);
-
-  if (alertsMatch && alertsMatch[1]) {
-    const numbers = alertsMatch[1]
-      .match(/\d{1,2}/g);
-
-    if (!numbers || numbers.length === 0) {
-      return { action: 'invalid_alerts' };
-    }
-
-    const thresholds = [...new Set(
-      numbers
-        .map((item) => Number.parseInt(item, 10))
-        .filter((item) => Number.isInteger(item) && item > 0 && item < 100)
-    )].sort((a, b) => a - b);
-
-    if (!thresholds.length) {
-      return { action: 'invalid_alerts' };
-    }
-
-    return {
-      action: 'set_alerts',
-      thresholds
-    };
+  if (/^(?:\/?(?:alertas|alerta))\b/i.test(commandText)) {
+    return { action: 'show_alerts_info' };
   }
 
   return null;
@@ -1407,22 +1425,17 @@ async function handleProfileCommand(sock, jid, userNumber, profile, command) {
     return true;
   }
 
-  if (command.action === 'set_alerts') {
-    await updateUserProfile(userNumber, {
-      alertThresholds: command.thresholds,
-      alertSent: {}
-    });
-
+  if (command.action === 'show_alerts_info' || command.action === 'set_alerts') {
     await safeReply(
       sock,
       jid,
-      `Alertas atualizados (saldo restante) para: ${command.thresholds.join('% / ')}%.`
+      [
+        `🔔 Alertas automáticos de consumo: ${formatAlertThresholdsLabel()}.`,
+        '- Dispara no consumo total do mês e por categoria.',
+        '- Base total: soma dos orçamentos por categoria (ou renda mensal, se não houver orçamento).',
+        '- Base por categoria: orçamento definido para a categoria.'
+      ].join('\n')
     );
-    return true;
-  }
-
-  if (command.action === 'invalid_alerts') {
-    await safeReply(sock, jid, 'Formato inválido. Exemplo: alertas 10 20 30');
     return true;
   }
 
@@ -1964,21 +1977,74 @@ async function notifySavedTransaction(sock, jid, userNumber, profile, record) {
   }
 }
 
-function evaluateBudgetAlert(profile, monthSummary, transaction) {
-  if (!profile || !profile.budgetByCategory || !transaction) {
-    return null;
+function parseSentThresholds(sentMap, alertKey) {
+  if (!sentMap || typeof sentMap !== 'object') {
+    return [];
   }
 
-  const category = transaction.categoria;
-  const budgetValue = Number(profile.budgetByCategory[category]);
-
-  if (!Number.isFinite(budgetValue) || budgetValue <= 0) {
-    return null;
+  if (!Array.isArray(sentMap[alertKey])) {
+    return [];
   }
 
-  const spent = Number(monthSummary.byCategory[category] || 0);
+  return sentMap[alertKey]
+    .map((item) => Number.parseInt(String(item), 10))
+    .filter((item) => Number.isInteger(item) && item > 0 && item <= 100);
+}
+
+function evaluateConsumptionAlertScope({ alertKey, label, spent, budget, monthLabel, sentMap }) {
+  if (!Number.isFinite(budget) || budget <= 0) {
+    return null;
+  }
 
   if (!Number.isFinite(spent) || spent <= 0) {
+    return null;
+  }
+
+  const consumedPercent = (spent / budget) * 100;
+  const sentThresholds = parseSentThresholds(sentMap, alertKey);
+  const newlyReached = ALERT_CONSUMPTION_THRESHOLDS.filter(
+    (threshold) => consumedPercent >= threshold && !sentThresholds.includes(threshold)
+  );
+
+  if (!newlyReached.length) {
+    return null;
+  }
+
+  const updatedSent = [...new Set([...sentThresholds, ...newlyReached])].sort((a, b) => a - b);
+  const thresholdTriggered = Math.max(...newlyReached);
+  const consumedPercentRounded = Math.round(consumedPercent);
+
+  if (consumedPercent > 100) {
+    return {
+      message: [
+        `⚠️ Atenção: ${label} excedeu o orçamento em ${monthLabel}.`,
+        `Consumo: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budget)} (${consumedPercentRounded}%).`
+      ].join('\n'),
+      updatedSent
+    };
+  }
+
+  if (thresholdTriggered === 100) {
+    return {
+      message: [
+        `⚠️ Alerta: ${label} atingiu 100% do orçamento em ${monthLabel}.`,
+        `Consumo: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budget)} (${consumedPercentRounded}%).`
+      ].join('\n'),
+      updatedSent
+    };
+  }
+
+  return {
+    message: [
+      `🔔 Alerta de consumo: ${label} chegou a ${thresholdTriggered}% em ${monthLabel}.`,
+      `Consumo: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budget)} (${consumedPercentRounded}%).`
+    ].join('\n'),
+    updatedSent
+  };
+}
+
+function evaluateBudgetAlert(profile, monthSummary, transaction) {
+  if (!profile || !transaction || !monthSummary) {
     return null;
   }
 
@@ -1988,67 +2054,57 @@ function evaluateBudgetAlert(profile, monthSummary, transaction) {
     return null;
   }
 
-  const alertKey = `${monthKey}:${category}`;
+  const monthLabel = `${monthKey.slice(5, 7)}/${monthKey.slice(0, 4)}`;
   const sentMap = profile.alertSent && typeof profile.alertSent === 'object'
     ? profile.alertSent
     : {};
-  const sentThresholds = Array.isArray(sentMap[alertKey])
-    ? sentMap[alertKey]
-      .map((item) => Number.parseInt(String(item), 10))
-      .filter((item) => Number.isInteger(item))
-    : [];
-  const alreadyExceededAlerted = sentThresholds.includes(100);
+  const patchAlertSent = {};
+  const messages = [];
 
-  const thresholds = Array.isArray(profile.alertThresholds) && profile.alertThresholds.length
-    ? profile.alertThresholds
-      .map((item) => Number.parseInt(String(item), 10))
-      .filter((item) => Number.isInteger(item) && item > 0 && item < 100)
-      .sort((a, b) => a - b)
-    : [...DEFAULT_ALERT_THRESHOLDS];
+  const totalBudget = resolveTotalBudgetForAlerts(profile);
+  const totalSpent = Number(monthSummary.total || 0);
+  const totalAlert = evaluateConsumptionAlertScope({
+    alertKey: `${monthKey}:total`,
+    label: 'o consumo total do mês',
+    spent: totalSpent,
+    budget: totalBudget,
+    monthLabel,
+    sentMap
+  });
 
-  const remainingValue = Math.max(0, budgetValue - spent);
-  const remainingPercent = budgetValue > 0 ? (remainingValue / budgetValue) * 100 : 0;
-  const newlyReached = thresholds.filter(
-    (threshold) => remainingPercent <= threshold && !sentThresholds.includes(threshold)
-  );
-
-  if (!newlyReached.length && spent < budgetValue) {
-    return null;
+  if (totalAlert) {
+    patchAlertSent[`${monthKey}:total`] = totalAlert.updatedSent;
+    messages.push(totalAlert.message);
   }
 
-  if (spent >= budgetValue && alreadyExceededAlerted) {
-    return null;
+  const category = sanitizeText(transaction.categoria);
+  const categoryBudget = category && profile.budgetByCategory
+    ? Number(profile.budgetByCategory[category])
+    : Number.NaN;
+  const categorySpent = Number(monthSummary.byCategory && monthSummary.byCategory[category] || 0);
+  const categoryAlertKey = `${monthKey}:category:${category}`;
+  const categoryAlert = evaluateConsumptionAlertScope({
+    alertKey: categoryAlertKey,
+    label: `o consumo da categoria ${category}`,
+    spent: categorySpent,
+    budget: categoryBudget,
+    monthLabel,
+    sentMap
+  });
+
+  if (categoryAlert) {
+    patchAlertSent[categoryAlertKey] = categoryAlert.updatedSent;
+    messages.push(categoryAlert.message);
   }
 
-  const updatedSent = [...new Set([
-    ...sentThresholds,
-    ...newlyReached,
-    ...(spent >= budgetValue ? [100] : [])
-  ])].sort((a, b) => a - b);
-  const thresholdTriggered = newlyReached.length ? Math.min(...newlyReached) : Math.min(...thresholds);
-  const monthLabel = `${monthKey.slice(5, 7)}/${monthKey.slice(0, 4)}`;
-
-  let message;
-
-  if (spent >= budgetValue) {
-    message = [
-      `⚠️ Atenção: você excedeu o orçamento de ${category} em ${monthLabel}.`,
-      `Gasto: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budgetValue)}.`
-    ].join('\n');
-  } else {
-    message = [
-      `⚠️ Alerta de orçamento: faltam ${thresholdTriggered}% ou menos em ${category} (${monthLabel}).`,
-      `Gasto: ${formatCurrencyBRL(spent)} de ${formatCurrencyBRL(budgetValue)}.`,
-      `Saldo restante: ${formatCurrencyBRL(remainingValue)} (${Math.round(remainingPercent)}%).`
-    ].join('\n');
+  if (!messages.length) {
+    return null;
   }
 
   return {
-    message,
+    message: messages.join('\n\n'),
     profilePatch: {
-      alertSent: {
-        [alertKey]: updatedSent
-      }
+      alertSent: patchAlertSent
     }
   };
 }
@@ -2123,6 +2179,12 @@ async function processIncomingMessage(sock, message) {
 
     if (!profile) {
       profile = await updateUserProfile(userNumber, {});
+    }
+
+    if (profile.accessEnabled === false) {
+      await safeReply(sock, jid, ACCESS_DISABLED_MESSAGE);
+      logInfo('WHATSAPP', 'Mensagem bloqueada por usuário desativado.', { user: userNumber });
+      return;
     }
 
     const conversationState = await getConversationState(userNumber);
