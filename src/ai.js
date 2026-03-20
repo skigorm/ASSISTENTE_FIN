@@ -6,6 +6,7 @@ const {
 } = require('./prompt');
 const {
   extractJSONObject,
+  inferCategoryFromText,
   logError,
   logInfo,
   logWarn,
@@ -126,6 +127,329 @@ function normalizeConfidence(value) {
   }
 
   return Number(normalized.toFixed(2));
+}
+
+const RECEIPT_BRAND_HINTS = [
+  /mercado\s*pago/i,
+  /pag\s*seguro|pagbank|moderninha/i,
+  /sumup/i,
+  /stone|ton\b/i,
+  /cielo/i,
+  /getnet/i,
+  /safra\s*pay/i,
+  /infinite\s*pay|infinitepay/i
+];
+
+const RECEIPT_NOISE_HINTS = [
+  /via\s*cliente|via\s*estabelecimento|comprovante/i,
+  /opera[cç][aã]o|autoriza[cç][aã]o|aprovado|negado/i,
+  /total|subtotal|parcela|valor\s*total/i,
+  /nfc|nsu|aid|lote|terminal|cart[aã]o|estab\.?/i,
+  /s[eé]rie|c[oó]digo|transa[cç][aã]o|documento/i,
+  /cr[eé]dito|d[eé]bito|pix|dinheiro/i
+];
+
+function isLikelyReceiptNoiseLine(rawLine) {
+  const line = sanitizeText(rawLine);
+
+  if (!line) {
+    return true;
+  }
+
+  const lower = line.toLowerCase();
+
+  if (RECEIPT_BRAND_HINTS.some((pattern) => pattern.test(lower))) {
+    return true;
+  }
+
+  if (RECEIPT_NOISE_HINTS.some((pattern) => pattern.test(lower))) {
+    return true;
+  }
+
+  if (!/[a-z]/i.test(line)) {
+    return true;
+  }
+
+  return false;
+}
+
+function extractAmountFromRawValue(rawValue) {
+  if (rawValue === null || rawValue === undefined) {
+    return Number.NaN;
+  }
+
+  if (typeof rawValue === 'number') {
+    return Number.isFinite(rawValue) ? rawValue : Number.NaN;
+  }
+
+  const safe = String(rawValue || '');
+  const currencyMatches = safe.match(/r\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:[.,][0-9]{2})?)/gi);
+
+  if (currencyMatches && currencyMatches.length) {
+    const parsedValues = currencyMatches
+      .map((item) => parseMoney(item))
+      .filter((item) => Number.isFinite(item) && item > 0);
+
+    if (parsedValues.length) {
+      return Math.max(...parsedValues);
+    }
+  }
+
+  return parseMoney(safe);
+}
+
+function extractAmountFromReceiptText(rawText) {
+  const text = String(rawText || '');
+
+  if (!text) {
+    return Number.NaN;
+  }
+
+  const totalPatterns = [
+    /(?:^|\n|\r|\s)total\s*[:\-]?\s*(?:r\$\s*)?([0-9][0-9\.,]*)/i,
+    /(?:^|\n|\r|\s)valor\s*total\s*[:\-]?\s*(?:r\$\s*)?([0-9][0-9\.,]*)/i,
+    /(?:^|\n|\r|\s)total\s+geral\s*[:\-]?\s*(?:r\$\s*)?([0-9][0-9\.,]*)/i
+  ];
+
+  for (const pattern of totalPatterns) {
+    const match = text.match(pattern);
+
+    if (match && match[1]) {
+      const parsed = extractAmountFromRawValue(match[1]);
+
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+
+  const allMoneyMatches = text.match(/r\$\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:[.,][0-9]{2})?)/gi);
+
+  if (!allMoneyMatches || !allMoneyMatches.length) {
+    return Number.NaN;
+  }
+
+  const values = allMoneyMatches
+    .map((item) => parseMoney(item))
+    .filter((item) => Number.isFinite(item) && item > 0);
+
+  if (!values.length) {
+    return Number.NaN;
+  }
+
+  return Math.max(...values);
+}
+
+function extractDateFromReceiptText(rawText, referenceDate) {
+  const text = String(rawText || '');
+
+  if (!text) {
+    return toISODate(referenceDate);
+  }
+
+  const dateMatch = text.match(/\b([0-3]?\d)[\/\-]([01]?\d)[\/\-]((?:20)?\d{2,4})\b/);
+
+  if (!dateMatch) {
+    return normalizeDate('', referenceDate);
+  }
+
+  const day = Number.parseInt(dateMatch[1], 10);
+  const month = Number.parseInt(dateMatch[2], 10);
+  let year = Number.parseInt(dateMatch[3], 10);
+
+  if (year < 100) {
+    year += 2000;
+  }
+
+  const maybeDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return normalizeDate(maybeDate, referenceDate);
+}
+
+function extractEstablishmentFromReceiptText(rawText) {
+  const lines = String(rawText || '')
+    .split(/\r?\n/)
+    .map((line) => sanitizeText(line))
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return '';
+  }
+
+  for (const line of lines) {
+    if (!/\d{11,14}/.test(line)) {
+      continue;
+    }
+
+    const beforeDoc = sanitizeText(line.replace(/\d{11,14}.*/, ''));
+
+    if (beforeDoc && beforeDoc.length >= 3 && !isLikelyReceiptNoiseLine(beforeDoc)) {
+      return beforeDoc;
+    }
+  }
+
+  for (const line of lines) {
+    if (isLikelyReceiptNoiseLine(line)) {
+      continue;
+    }
+
+    if (/[a-z]/i.test(line) && line.length >= 3) {
+      return line;
+    }
+  }
+
+  return '';
+}
+
+function extractPaymentMethodFromReceiptText(rawText) {
+  const text = String(rawText || '');
+
+  if (!text) {
+    return '';
+  }
+
+  const cardMatch = text.match(/\b(cr[eé]dito|d[eé]bito)\b[^\n\r]{0,30}/i);
+  if (cardMatch && cardMatch[0]) {
+    return sanitizeText(cardMatch[0]);
+  }
+
+  const pixMatch = text.match(/\bpix\b/i);
+  if (pixMatch) {
+    return 'PIX';
+  }
+
+  const cashMatch = text.match(/\bdinheiro\b/i);
+  if (cashMatch) {
+    return 'Dinheiro';
+  }
+
+  return '';
+}
+
+function buildReceiptDescription(baseDescription, estabelecimento, paymentMethod) {
+  const description = sanitizeText(baseDescription);
+
+  if (description && description.toLowerCase() !== 'sem descrição') {
+    return description;
+  }
+
+  if (estabelecimento && paymentMethod) {
+    return sanitizeText(`Compra em ${estabelecimento} (${paymentMethod})`);
+  }
+
+  if (estabelecimento) {
+    return sanitizeText(`Compra em ${estabelecimento}`);
+  }
+
+  if (paymentMethod) {
+    return sanitizeText(`Compra via ${paymentMethod}`);
+  }
+
+  return 'Compra no comprovante';
+}
+
+function normalizeReceiptPayload(parsed, referenceDate, customCategories) {
+  if (!parsed || typeof parsed !== 'object') {
+    return null;
+  }
+
+  const rawOcrText = String(
+    parsed.texto_ocr ||
+    parsed.ocr_text ||
+    parsed.texto ||
+    parsed.raw_text ||
+    parsed.comprovante_texto ||
+    ''
+  );
+  const ocrText = sanitizeText(rawOcrText);
+
+  const amountCandidates = [
+    parsed.valor,
+    parsed.valor_total,
+    parsed.total,
+    parsed.amount,
+    parsed.valorFinal,
+    parsed.valor_final
+  ];
+
+  let amount = Number.NaN;
+
+  for (const candidate of amountCandidates) {
+    const parsedAmount = extractAmountFromRawValue(candidate);
+
+    if (Number.isFinite(parsedAmount) && parsedAmount > 0) {
+      amount = parsedAmount;
+      break;
+    }
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    amount = extractAmountFromReceiptText(rawOcrText || ocrText);
+  }
+
+  const parsedDate = sanitizeText(
+    String(parsed.data || parsed.data_hora || parsed.dataHora || parsed.datetime || '')
+  );
+  const date = parsedDate
+    ? normalizeDate(parsedDate, referenceDate)
+    : extractDateFromReceiptText(rawOcrText || ocrText, referenceDate);
+
+  const estabelecimento = sanitizeText(
+    String(
+      parsed.estabelecimento ||
+      parsed.loja ||
+      parsed.merchant ||
+      parsed.nome_estabelecimento ||
+      extractEstablishmentFromReceiptText(rawOcrText || ocrText) ||
+      ''
+    )
+  );
+
+  const paymentMethod = sanitizeText(
+    String(
+      parsed.forma_pagamento ||
+      parsed.meio_pagamento ||
+      parsed.pagamento ||
+      parsed.metodo_pagamento ||
+      extractPaymentMethodFromReceiptText(rawOcrText || ocrText) ||
+      ''
+    )
+  );
+
+  const categoryInput = sanitizeText(String(parsed.categoria || ''));
+  const category = categoryInput
+    ? normalizeCategory(categoryInput, customCategories)
+    : inferCategoryFromText(`${estabelecimento} ${paymentMethod} ${ocrText}`, customCategories);
+
+  const descricao = buildReceiptDescription(
+    parsed.descricao || parsed.item || parsed.produto || '',
+    estabelecimento,
+    paymentMethod
+  );
+
+  const normalized = normalizeTransaction(
+    {
+      valor: amount,
+      categoria: category || 'Outros',
+      descricao,
+      data: date
+    },
+    referenceDate,
+    { customCategories }
+  );
+
+  if (!normalized.valid) {
+    return {
+      valid: false,
+      errors: normalized.errors,
+      estabelecimento
+    };
+  }
+
+  return {
+    valid: true,
+    data: normalized.data,
+    estabelecimento
+  };
 }
 
 async function parseTransactionWithAI(text, referenceDate = new Date(), options = {}) {
@@ -277,10 +601,10 @@ async function parseReceiptWithAI(
     return null;
   }
 
-  const normalized = normalizeTransaction(parsed, referenceDate, { customCategories });
+  const normalizedReceipt = normalizeReceiptPayload(parsed, referenceDate, customCategories);
 
-  if (!normalized.valid) {
-    logWarn('AI', 'Comprovante inválido após normalização.', normalized.errors);
+  if (!normalizedReceipt || !normalizedReceipt.valid) {
+    logWarn('AI', 'Comprovante inválido após normalização.', normalizedReceipt ? normalizedReceipt.errors : parsed);
     return null;
   }
 
@@ -292,13 +616,11 @@ async function parseReceiptWithAI(
   ];
   const rawConfidence = rawConfidenceCandidates.find((item) => item !== null && item !== undefined);
   const confidence = normalizeConfidence(rawConfidence);
-  const estabelecimento = sanitizeText(
-    String(parsed.estabelecimento || parsed.loja || parsed.merchant || '')
-  );
+  const estabelecimento = sanitizeText(normalizedReceipt.estabelecimento);
 
   logInfo('AI', 'Comprovante interpretado com sucesso pela OpenAI.');
   return {
-    transaction: normalized.data,
+    transaction: normalizedReceipt.data,
     estabelecimento,
     confidence
   };

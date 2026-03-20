@@ -54,19 +54,24 @@ function buildReceiptSystemPrompt(referenceDate, customCategories = []) {
 
   return [
     'Você extrai dados de comprovantes financeiros em português a partir de imagem.',
+    'O comprovante pode ser de qualquer adquirente, banco ou emissor; não assuma marca específica.',
+    'Exemplos apenas ilustrativos: Mercado Pago, Cielo, Stone, Getnet, SumUp, PagSeguro, SafraPay.',
     'Responda apenas com JSON válido, sem markdown, sem texto adicional e sem comentários.',
     'Formato obrigatório de saída:',
-    `{"valor": number, "categoria": "${categoryRule}", "descricao": "string", "data": "YYYY-MM-DD", "estabelecimento": "string", "confianca": number}`,
+    `{"valor": number, "categoria": "${categoryRule}", "descricao": "string", "data": "YYYY-MM-DD", "estabelecimento": "string", "confianca": number, "forma_pagamento": "string", "texto_ocr": "string"}`,
     'Regras obrigatórias:',
     '1) valor deve ser número positivo com ponto para casas decimais.',
-    `2) categoria deve ser exatamente uma das opções: ${categoryList.join(', ')}.`,
-    '3) descricao deve ser curta e objetiva, descrevendo o gasto principal.',
-    '4) data deve estar em YYYY-MM-DD.',
-    `5) Se a data não estiver legível, use a data de referência ${referenceDate}.`,
-    '6) estabelecimento deve ser string curta (nome da loja/empresa) ou string vazia quando ausente.',
-    '7) confianca deve ser número entre 0 e 1.',
-    '8) Nunca inclua chaves extras.',
-    '9) Nunca retorne null ou texto fora do JSON.'
+    '2) Para comprovante de cartão, priorize o valor do campo TOTAL/VALOR TOTAL.',
+    '3) Ignore parcelas quando não mudarem o valor total (ex: 1x R$ 465,00).',
+    `4) categoria deve ser exatamente uma das opções: ${categoryList.join(', ')}.`,
+    '5) descricao deve ser curta e objetiva, descrevendo o gasto principal.',
+    '6) data deve estar em YYYY-MM-DD.',
+    `7) Se a data não estiver legível, use a data de referência ${referenceDate}.`,
+    '8) estabelecimento deve trazer o nome da loja/empresa (não o nome da adquirente da maquininha, quando houver).',
+    '9) forma_pagamento deve trazer algo como: CRÉDITO AMEX 7429, DÉBITO, PIX, DINHEIRO.',
+    '10) confianca deve ser número entre 0 e 1.',
+    '11) texto_ocr deve conter texto relevante lido da imagem (pode ser vazio se ilegível).',
+    '12) Nunca retorne null ou texto fora do JSON.'
   ].join('\n');
 }
 
