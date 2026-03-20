@@ -1822,7 +1822,8 @@ async function tryHandleReceiptImage(sock, jid, userNumber, message, imageMessag
       jid,
       [
         'Não consegui identificar os dados do comprovante.',
-        'Tente uma foto mais nítida e com o valor visível.'
+        'Tente reenviar com boa iluminação e o valor total visível.',
+        'Se preferir, envie a foto com uma legenda: "valor 465 categoria alimentação".'
       ].join('\n')
     );
     return true;

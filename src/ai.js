@@ -21,22 +21,62 @@ const {
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 
-function parseModelOutput(content) {
-  if (content && typeof content === 'object') {
+function normalizeAssistantContent(content) {
+  if (typeof content === 'string') {
     return content;
   }
 
-  if (typeof content !== 'string') {
+  if (!Array.isArray(content)) {
     return null;
   }
 
-  const direct = safeJsonParse(content);
+  const parts = content
+    .map((item) => {
+      if (typeof item === 'string') {
+        return item;
+      }
+
+      if (!item || typeof item !== 'object') {
+        return '';
+      }
+
+      if (typeof item.text === 'string') {
+        return item.text;
+      }
+
+      if (typeof item.content === 'string') {
+        return item.content;
+      }
+
+      return '';
+    })
+    .filter(Boolean);
+
+  if (!parts.length) {
+    return null;
+  }
+
+  return parts.join('\n');
+}
+
+function parseModelOutput(content) {
+  if (content && typeof content === 'object' && !Array.isArray(content)) {
+    return content;
+  }
+
+  const normalizedContent = normalizeAssistantContent(content);
+
+  if (typeof normalizedContent !== 'string') {
+    return null;
+  }
+
+  const direct = safeJsonParse(normalizedContent);
 
   if (direct) {
     return direct;
   }
 
-  const extracted = extractJSONObject(content);
+  const extracted = extractJSONObject(normalizedContent);
   return extracted ? safeJsonParse(extracted) : null;
 }
 
@@ -54,18 +94,21 @@ async function callOpenAIJson(messages, options = {}) {
   const payload = {
     model,
     temperature: 0,
-    response_format: { type: 'json_object' },
     messages
   };
+
+  if (options.responseFormat !== false) {
+    payload.response_format = { type: 'json_object' };
+  }
 
   if (Number.isFinite(Number(options.maxTokens)) && Number(options.maxTokens) > 0) {
     payload.max_tokens = Number(options.maxTokens);
   }
 
-  try {
+  const request = async (requestPayload) => {
     const response = await axios.post(
       OPENAI_URL,
-      payload,
+      requestPayload,
       {
         headers: {
           Authorization: `Bearer ${process.env.OPENAI_KEY}`,
@@ -76,13 +119,17 @@ async function callOpenAIJson(messages, options = {}) {
     );
 
     const choices = response && response.data ? response.data.choices : null;
-    const content = Array.isArray(choices) && choices[0] && choices[0].message
+    return Array.isArray(choices) && choices[0] && choices[0].message
       ? choices[0].message.content
       : null;
+  };
+
+  try {
+    const content = await request(payload);
     const parsed = parseModelOutput(content);
 
     if (!parsed) {
-      logWarn('AI', 'Resposta da OpenAI não veio como JSON interpretável.', { content });
+      logWarn('AI', 'Resposta da OpenAI não veio como JSON interpretável.', { model, content });
       return null;
     }
 
@@ -92,8 +139,57 @@ async function callOpenAIJson(messages, options = {}) {
     const apiError = error && error.response && error.response.data
       ? error.response.data.error
       : error.message;
+    const message = sanitizeText(
+      String(
+        apiError && typeof apiError === 'object'
+          ? apiError.message || JSON.stringify(apiError)
+          : apiError || ''
+      )
+    );
+
+    const canRetryWithoutResponseFormat = (
+      options.responseFormat !== false &&
+      status === 400 &&
+      /response[_\s-]?format|json[_\s-]?object/i.test(message)
+    );
+
+    if (canRetryWithoutResponseFormat) {
+      try {
+        logWarn('AI', 'Modelo rejeitou response_format; tentando novamente sem response_format.', {
+          model
+        });
+        const retryPayload = {
+          ...payload
+        };
+        delete retryPayload.response_format;
+        const content = await request(retryPayload);
+        const parsed = parseModelOutput(content);
+
+        if (!parsed) {
+          logWarn('AI', 'Retry sem response_format também não retornou JSON interpretável.', {
+            model,
+            content
+          });
+          return null;
+        }
+
+        return parsed;
+      } catch (retryError) {
+        const retryStatus = retryError && retryError.response ? retryError.response.status : undefined;
+        const retryApiError = retryError && retryError.response && retryError.response.data
+          ? retryError.response.data.error
+          : retryError.message;
+        logError('AI', 'Erro no retry da OpenAI sem response_format.', {
+          model,
+          status: retryStatus,
+          error: retryApiError
+        });
+        return null;
+      }
+    }
 
     logError('AI', 'Erro ao chamar OpenAI API.', {
+      model,
       status,
       error: apiError
     });
@@ -562,40 +658,52 @@ async function parseReceiptWithAI(
 
   const referenceDateISO = toISODate(referenceDate);
   const cleanCaption = sanitizeText(caption);
-  const visionModel = sanitizeText(process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini');
+  const configuredVisionModel = sanitizeText(process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini');
+  const fallbackVisionModel = sanitizeText(process.env.OPENAI_VISION_FALLBACK_MODEL || 'gpt-4o');
   const userText = cleanCaption
     ? `Legenda enviada junto com a imagem: "${cleanCaption}".`
     : 'Sem legenda adicional.';
 
-  const parsed = await callOpenAIJson(
-    [
-      {
-        role: 'system',
-        content: buildReceiptSystemPrompt(referenceDateISO, customCategories)
-      },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: userText
-          },
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:${finalMimeType};base64,${base64Image}`,
-              detail: 'auto'
-            }
-          }
-        ]
-      }
-    ],
+  const messages = [
     {
-      model: visionModel,
-      timeout: 35000,
-      maxTokens: 500
+      role: 'system',
+      content: buildReceiptSystemPrompt(referenceDateISO, customCategories)
+    },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: userText
+        },
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:${finalMimeType};base64,${base64Image}`,
+            detail: 'high'
+          }
+        }
+      ]
     }
-  );
+  ];
+
+  let parsed = await callOpenAIJson(messages, {
+    model: configuredVisionModel,
+    timeout: 45000,
+    maxTokens: 700
+  });
+
+  if (!parsed && fallbackVisionModel && fallbackVisionModel !== configuredVisionModel) {
+    logWarn('AI', 'Primeira tentativa de leitura de comprovante falhou. Tentando fallback de modelo.', {
+      configuredVisionModel,
+      fallbackVisionModel
+    });
+    parsed = await callOpenAIJson(messages, {
+      model: fallbackVisionModel,
+      timeout: 45000,
+      maxTokens: 700
+    });
+  }
 
   if (!parsed || typeof parsed !== 'object') {
     return null;
