@@ -81,9 +81,19 @@ function parseModelOutput(content) {
 }
 
 async function callOpenAIJson(messages, options = {}) {
+  const withMeta = options.withMeta === true;
+  const buildResult = (parsed, error = null) => (
+    withMeta
+      ? { parsed, error }
+      : parsed
+  );
+
   if (!process.env.OPENAI_KEY) {
     logWarn('AI', 'OPENAI_KEY não configurada. Usando fallback local.');
-    return null;
+    return buildResult(null, {
+      code: 'openai_key_missing',
+      message: 'OPENAI_KEY não configurada.'
+    });
   }
 
   const model = sanitizeText(options.model || process.env.OPENAI_MODEL || 'gpt-4o-mini');
@@ -130,10 +140,13 @@ async function callOpenAIJson(messages, options = {}) {
 
     if (!parsed) {
       logWarn('AI', 'Resposta da OpenAI não veio como JSON interpretável.', { model, content });
-      return null;
+      return buildResult(null, {
+        code: 'openai_non_json_response',
+        message: sanitizeText(normalizeAssistantContent(content) || '')
+      });
     }
 
-    return parsed;
+    return buildResult(parsed);
   } catch (error) {
     const status = error && error.response ? error.response.status : undefined;
     const apiError = error && error.response && error.response.data
@@ -153,6 +166,20 @@ async function callOpenAIJson(messages, options = {}) {
       /response[_\s-]?format|json[_\s-]?object/i.test(message)
     );
 
+    let baseErrorCode = 'openai_request_failed';
+
+    if (error && error.code === 'ECONNABORTED') {
+      baseErrorCode = 'openai_timeout';
+    } else if (status === 401 || status === 403) {
+      baseErrorCode = 'openai_auth_failed';
+    } else if (status === 429) {
+      baseErrorCode = 'openai_rate_limit';
+    } else if (status === 400) {
+      baseErrorCode = 'openai_bad_request';
+    } else if (Number.isFinite(status) && status >= 500) {
+      baseErrorCode = 'openai_server_error';
+    }
+
     if (canRetryWithoutResponseFormat) {
       try {
         logWarn('AI', 'Modelo rejeitou response_format; tentando novamente sem response_format.', {
@@ -170,21 +197,49 @@ async function callOpenAIJson(messages, options = {}) {
             model,
             content
           });
-          return null;
+          return buildResult(null, {
+            code: 'openai_non_json_response',
+            message: sanitizeText(normalizeAssistantContent(content) || '')
+          });
         }
 
-        return parsed;
+        return buildResult(parsed);
       } catch (retryError) {
         const retryStatus = retryError && retryError.response ? retryError.response.status : undefined;
         const retryApiError = retryError && retryError.response && retryError.response.data
           ? retryError.response.data.error
           : retryError.message;
+        const retryMessage = sanitizeText(
+          String(
+            retryApiError && typeof retryApiError === 'object'
+              ? retryApiError.message || JSON.stringify(retryApiError)
+              : retryApiError || ''
+          )
+        );
+        let retryErrorCode = 'openai_request_failed';
+
+        if (retryError && retryError.code === 'ECONNABORTED') {
+          retryErrorCode = 'openai_timeout';
+        } else if (retryStatus === 401 || retryStatus === 403) {
+          retryErrorCode = 'openai_auth_failed';
+        } else if (retryStatus === 429) {
+          retryErrorCode = 'openai_rate_limit';
+        } else if (retryStatus === 400) {
+          retryErrorCode = 'openai_bad_request';
+        } else if (Number.isFinite(retryStatus) && retryStatus >= 500) {
+          retryErrorCode = 'openai_server_error';
+        }
+
         logError('AI', 'Erro no retry da OpenAI sem response_format.', {
           model,
           status: retryStatus,
           error: retryApiError
         });
-        return null;
+        return buildResult(null, {
+          code: retryErrorCode,
+          status: retryStatus,
+          message: retryMessage
+        });
       }
     }
 
@@ -193,7 +248,11 @@ async function callOpenAIJson(messages, options = {}) {
       status,
       error: apiError
     });
-    return null;
+    return buildResult(null, {
+      code: baseErrorCode,
+      status,
+      message
+    });
   }
 }
 
@@ -687,33 +746,52 @@ async function parseReceiptWithAI(
     }
   ];
 
-  let parsed = await callOpenAIJson(messages, {
+  let firstAttempt = await callOpenAIJson(messages, {
     model: configuredVisionModel,
     timeout: 45000,
-    maxTokens: 700
+    maxTokens: 700,
+    withMeta: true
   });
+  let parsed = firstAttempt && firstAttempt.parsed ? firstAttempt.parsed : null;
+  let lastError = firstAttempt && firstAttempt.error ? firstAttempt.error : null;
 
   if (!parsed && fallbackVisionModel && fallbackVisionModel !== configuredVisionModel) {
     logWarn('AI', 'Primeira tentativa de leitura de comprovante falhou. Tentando fallback de modelo.', {
       configuredVisionModel,
       fallbackVisionModel
     });
-    parsed = await callOpenAIJson(messages, {
+    const fallbackAttempt = await callOpenAIJson(messages, {
       model: fallbackVisionModel,
       timeout: 45000,
-      maxTokens: 700
+      maxTokens: 700,
+      withMeta: true
     });
+    parsed = fallbackAttempt && fallbackAttempt.parsed ? fallbackAttempt.parsed : null;
+    lastError = fallbackAttempt && fallbackAttempt.error ? fallbackAttempt.error : lastError;
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    return null;
+    return {
+      errorCode: sanitizeText(lastError && lastError.code),
+      errorStatus: lastError && Number.isFinite(Number(lastError.status))
+        ? Number(lastError.status)
+        : null,
+      errorMessage: sanitizeText(lastError && lastError.message)
+    };
   }
 
   const normalizedReceipt = normalizeReceiptPayload(parsed, referenceDate, customCategories);
 
   if (!normalizedReceipt || !normalizedReceipt.valid) {
     logWarn('AI', 'Comprovante inválido após normalização.', normalizedReceipt ? normalizedReceipt.errors : parsed);
-    return null;
+    return {
+      errorCode: 'receipt_normalization_failed',
+      errorMessage: sanitizeText(
+        Array.isArray(normalizedReceipt && normalizedReceipt.errors)
+          ? normalizedReceipt.errors.join(', ')
+          : 'Falha ao normalizar campos do comprovante.'
+      )
+    };
   }
 
   const rawConfidenceCandidates = [

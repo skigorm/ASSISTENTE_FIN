@@ -1813,19 +1813,24 @@ async function tryHandleReceiptImage(sock, jid, userNumber, message, imageMessag
   );
 
   if (!receiptResult || !receiptResult.transaction) {
+    const errorCode = sanitizeText(receiptResult && receiptResult.errorCode);
+    const errorStatus = receiptResult && Number.isFinite(Number(receiptResult.errorStatus))
+      ? Number(receiptResult.errorStatus)
+      : null;
+    const errorMessage = sanitizeText(receiptResult && receiptResult.errorMessage);
+
+    logWarn('WHATSAPP', 'Falha na leitura de comprovante.', {
+      user: userNumber,
+      errorCode: errorCode || 'receipt_unknown_error',
+      errorStatus,
+      errorMessage
+    });
+
     if (text) {
       return false;
     }
 
-    await safeReply(
-      sock,
-      jid,
-      [
-        'Não consegui identificar os dados do comprovante.',
-        'Tente reenviar com boa iluminação e o valor total visível.',
-        'Se preferir, envie a foto com uma legenda: "valor 465 categoria alimentação".'
-      ].join('\n')
-    );
+    await safeReply(sock, jid, buildReceiptFailureMessage(receiptResult));
     return true;
   }
 
@@ -1904,6 +1909,65 @@ function buildReceiptConfirmationMessage(receiptResult) {
     '',
     'Deseja salvar esse gasto? (sim/não)'
   ].filter(Boolean).join('\n');
+}
+
+function buildReceiptFailureMessage(receiptResult) {
+  const errorCode = sanitizeText(receiptResult && receiptResult.errorCode);
+
+  if (errorCode === 'openai_key_missing') {
+    return [
+      'Não consegui ler o comprovante porque a IA não está configurada.',
+      'Configure a variável OPENAI_KEY no ambiente do bot e reinicie o serviço.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_auth_failed') {
+    return [
+      'Não consegui ler o comprovante porque a chave da OpenAI foi recusada.',
+      'Verifique o valor de OPENAI_KEY e reinicie o serviço.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_rate_limit') {
+    return [
+      'A OpenAI está com limite de requisições no momento.',
+      'Tente novamente em 1-2 minutos.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_timeout' || errorCode === 'openai_server_error') {
+    return [
+      'A leitura do comprovante demorou demais ou o serviço de IA falhou temporariamente.',
+      'Tente novamente em instantes.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_bad_request') {
+    return [
+      'Não consegui processar essa imagem com o modelo de IA configurado.',
+      'Revise OPENAI_VISION_MODEL/OPENAI_VISION_FALLBACK_MODEL e tente novamente.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_non_json_response') {
+    return [
+      'A IA recebeu a imagem, mas não devolveu os dados em formato válido.',
+      'Tente novamente e, se persistir, revise o modelo OPENAI_VISION_MODEL.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'receipt_normalization_failed') {
+    return [
+      'Consegui ler parte do comprovante, mas não foi possível validar os campos obrigatórios.',
+      'Envie novamente com uma legenda ajudando no valor/categoria (ex: "valor 465 categoria alimentação").'
+    ].join('\n');
+  }
+
+  return [
+    'Não consegui identificar os dados do comprovante.',
+    'Tente reenviar com boa iluminação e o valor total visível.',
+    'Se preferir, envie a foto com uma legenda: "valor 465 categoria alimentação".'
+  ].join('\n');
 }
 
 async function notifySavedTransaction(sock, jid, userNumber, profile, record) {
