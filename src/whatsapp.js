@@ -44,8 +44,10 @@ const RECONNECT_DELAY_MS = 5000;
 const CONVERSATION_STATE_TTL_SECONDS = 24 * 60 * 60;
 
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
-const MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_MESSAGES';
-const IGNORED_MESSAGE_LOGS_ENV = 'WHATSAPP_LOG_IGNORED_MESSAGES';
+const FRIENDLY_SUPPORT_MESSAGE = [
+  'Desculpe, não consegui processar sua mensagem agora.',
+  'Por favor, entre em contato com o administrador para suporte.'
+].join(' ');
 
 const silentBaileysLogger = {
   level: 'silent',
@@ -102,24 +104,6 @@ async function getBaileysRuntime() {
   }
 
   return baileysRuntimePromise;
-}
-
-function isEnvEnabled(name, defaultValue = false) {
-  const value = String(process.env[name] || '').trim().toLowerCase();
-
-  if (!value) {
-    return defaultValue;
-  }
-
-  return ['1', 'true', 'yes', 'on'].includes(value);
-}
-
-function shouldLogMessages() {
-  return isEnvEnabled(MESSAGE_LOGS_ENV, true);
-}
-
-function shouldLogIgnoredMessages() {
-  return isEnvEnabled(IGNORED_MESSAGE_LOGS_ENV, false);
 }
 
 function getPairingNumber() {
@@ -388,21 +372,7 @@ async function downloadImageBuffer(sock, message) {
 
 async function safeReply(sock, jid, text) {
   try {
-    if (shouldLogMessages()) {
-      logInfo('WHATSAPP', 'Enviando mensagem.', {
-        jid,
-        text: sanitizeText(text)
-      });
-    }
-
     await sock.sendMessage(jid, { text });
-
-    if (shouldLogMessages()) {
-      logInfo('WHATSAPP', 'Mensagem enviada com sucesso.', {
-        jid,
-        text: sanitizeText(text)
-      });
-    }
   } catch (error) {
     logError('WHATSAPP', 'Falha ao enviar resposta ao usuário.', {
       jid,
@@ -2116,25 +2086,22 @@ function isSupportedDirectChat(jid) {
 }
 
 async function processIncomingMessage(sock, message) {
+  let jid = null;
+  let fromMe = false;
+
   try {
     if (!message || !message.message) {
       return;
     }
 
-    const jid = message.key ? message.key.remoteJid : null;
-    const fromMe = message.key && message.key.fromMe;
+    jid = message.key ? message.key.remoteJid : null;
+    fromMe = Boolean(message.key && message.key.fromMe);
 
     if (fromMe) {
-      if (shouldLogIgnoredMessages()) {
-        logInfo('WHATSAPP', 'Mensagem ignorada (fromMe=true).', { jid });
-      }
       return;
     }
 
     if (!isSupportedDirectChat(jid)) {
-      if (shouldLogIgnoredMessages()) {
-        logInfo('WHATSAPP', 'Mensagem ignorada (chat não suportado).', { jid });
-      }
       return;
     }
 
@@ -2142,24 +2109,12 @@ async function processIncomingMessage(sock, message) {
     const imageMessage = extractImageMessage(message.message);
 
     if (!rawText && !imageMessage) {
-      if (shouldLogIgnoredMessages()) {
-        logInfo('WHATSAPP', 'Mensagem ignorada (tipo não suportado).', { jid });
-      }
       return;
     }
 
     const text = sanitizeText(rawText);
 
     const userNumber = normalizeUserId(jid);
-
-    if (shouldLogMessages()) {
-      logInfo('WHATSAPP', 'Mensagem recebida.', {
-        jid,
-        user: userNumber,
-        text: text || '(sem texto)',
-        hasImage: Boolean(imageMessage)
-      });
-    }
 
     const referenceDate = new Date();
     const commandText = normalizeCommandText(text);
@@ -2338,6 +2293,10 @@ async function processIncomingMessage(sock, message) {
 
     logInfo('WHATSAPP', 'Transação processada com sucesso.', saveResult.record);
   } catch (error) {
+    if (jid && !fromMe && isSupportedDirectChat(jid)) {
+      await safeReply(sock, jid, FRIENDLY_SUPPORT_MESSAGE);
+    }
+
     logError('WHATSAPP', 'Erro ao processar mensagem.', error.message);
   }
 }
