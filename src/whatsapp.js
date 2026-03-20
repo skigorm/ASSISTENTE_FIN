@@ -1935,6 +1935,13 @@ function buildReceiptFailureMessage(receiptResult) {
     ].join('\n');
   }
 
+  if (errorCode === 'openai_quota_exceeded') {
+    return [
+      'A cota da OpenAI foi excedida para este projeto.',
+      'Revise billing/créditos da API e tente novamente.'
+    ].join('\n');
+  }
+
   if (errorCode === 'openai_timeout' || errorCode === 'openai_server_error') {
     return [
       'A leitura do comprovante demorou demais ou o serviço de IA falhou temporariamente.',

@@ -80,6 +80,59 @@ function parseModelOutput(content) {
   return extracted ? safeJsonParse(extracted) : null;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function buildOpenAIErrorMeta(error) {
+  const status = error && error.response ? error.response.status : undefined;
+  const apiError = error && error.response && error.response.data
+    ? error.response.data.error
+    : error && error.message
+      ? error.message
+      : '';
+  const message = sanitizeText(
+    String(
+      apiError && typeof apiError === 'object'
+        ? apiError.message || JSON.stringify(apiError)
+        : apiError || ''
+    )
+  );
+  const errorType = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.type : '')).toLowerCase();
+  const errorCode = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.code : '')).toLowerCase();
+
+  let code = 'openai_request_failed';
+
+  if (error && error.code === 'ECONNABORTED') {
+    code = 'openai_timeout';
+  } else if (status === 401 || status === 403) {
+    code = 'openai_auth_failed';
+  } else if (status === 429) {
+    if (
+      /insufficient[_\s-]?quota/.test(errorType) ||
+      /insufficient[_\s-]?quota/.test(errorCode) ||
+      /insufficient quota|quota exceeded|billing/i.test(message)
+    ) {
+      code = 'openai_quota_exceeded';
+    } else {
+      code = 'openai_rate_limit';
+    }
+  } else if (status === 400) {
+    code = 'openai_bad_request';
+  } else if (Number.isFinite(status) && status >= 500) {
+    code = 'openai_server_error';
+  }
+
+  return {
+    code,
+    status,
+    message,
+    apiError
+  };
+}
+
 async function callOpenAIJson(messages, options = {}) {
   const withMeta = options.withMeta === true;
   const buildResult = (parsed, error = null) => (
@@ -115,23 +168,47 @@ async function callOpenAIJson(messages, options = {}) {
     payload.max_tokens = Number(options.maxTokens);
   }
 
-  const request = async (requestPayload) => {
-    const response = await axios.post(
-      OPENAI_URL,
-      requestPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout
-      }
-    );
+  const maxRateLimitRetries = Number.isFinite(Number(options.maxRateLimitRetries))
+    ? Math.max(0, Math.min(3, Number(options.maxRateLimitRetries)))
+    : 2;
 
-    const choices = response && response.data ? response.data.choices : null;
-    return Array.isArray(choices) && choices[0] && choices[0].message
-      ? choices[0].message.content
-      : null;
+  const request = async (requestPayload) => {
+    for (let attempt = 0; attempt <= maxRateLimitRetries; attempt += 1) {
+      try {
+        const response = await axios.post(
+          OPENAI_URL,
+          requestPayload,
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.OPENAI_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            timeout
+          }
+        );
+
+        const choices = response && response.data ? response.data.choices : null;
+        return Array.isArray(choices) && choices[0] && choices[0].message
+          ? choices[0].message.content
+          : null;
+      } catch (error) {
+        const errorMeta = buildOpenAIErrorMeta(error);
+
+        if (errorMeta.code !== 'openai_rate_limit' || attempt >= maxRateLimitRetries) {
+          throw error;
+        }
+
+        const waitMs = 1200 * (attempt + 1);
+        logWarn('AI', 'Rate limit temporário da OpenAI. Aguardando retry automático.', {
+          model,
+          attempt: attempt + 1,
+          waitMs
+        });
+        await sleep(waitMs);
+      }
+    }
+
+    return null;
   };
 
   try {
@@ -148,37 +225,18 @@ async function callOpenAIJson(messages, options = {}) {
 
     return buildResult(parsed);
   } catch (error) {
-    const status = error && error.response ? error.response.status : undefined;
-    const apiError = error && error.response && error.response.data
-      ? error.response.data.error
-      : error.message;
-    const message = sanitizeText(
-      String(
-        apiError && typeof apiError === 'object'
-          ? apiError.message || JSON.stringify(apiError)
-          : apiError || ''
-      )
-    );
+    const errorMeta = buildOpenAIErrorMeta(error);
+    const {
+      status,
+      apiError,
+      message
+    } = errorMeta;
 
     const canRetryWithoutResponseFormat = (
       options.responseFormat !== false &&
       status === 400 &&
       /response[_\s-]?format|json[_\s-]?object/i.test(message)
     );
-
-    let baseErrorCode = 'openai_request_failed';
-
-    if (error && error.code === 'ECONNABORTED') {
-      baseErrorCode = 'openai_timeout';
-    } else if (status === 401 || status === 403) {
-      baseErrorCode = 'openai_auth_failed';
-    } else if (status === 429) {
-      baseErrorCode = 'openai_rate_limit';
-    } else if (status === 400) {
-      baseErrorCode = 'openai_bad_request';
-    } else if (Number.isFinite(status) && status >= 500) {
-      baseErrorCode = 'openai_server_error';
-    }
 
     if (canRetryWithoutResponseFormat) {
       try {
@@ -205,30 +263,11 @@ async function callOpenAIJson(messages, options = {}) {
 
         return buildResult(parsed);
       } catch (retryError) {
-        const retryStatus = retryError && retryError.response ? retryError.response.status : undefined;
-        const retryApiError = retryError && retryError.response && retryError.response.data
-          ? retryError.response.data.error
-          : retryError.message;
-        const retryMessage = sanitizeText(
-          String(
-            retryApiError && typeof retryApiError === 'object'
-              ? retryApiError.message || JSON.stringify(retryApiError)
-              : retryApiError || ''
-          )
-        );
-        let retryErrorCode = 'openai_request_failed';
-
-        if (retryError && retryError.code === 'ECONNABORTED') {
-          retryErrorCode = 'openai_timeout';
-        } else if (retryStatus === 401 || retryStatus === 403) {
-          retryErrorCode = 'openai_auth_failed';
-        } else if (retryStatus === 429) {
-          retryErrorCode = 'openai_rate_limit';
-        } else if (retryStatus === 400) {
-          retryErrorCode = 'openai_bad_request';
-        } else if (Number.isFinite(retryStatus) && retryStatus >= 500) {
-          retryErrorCode = 'openai_server_error';
-        }
+        const retryMeta = buildOpenAIErrorMeta(retryError);
+        const retryStatus = retryMeta.status;
+        const retryApiError = retryMeta.apiError;
+        const retryMessage = retryMeta.message;
+        const retryErrorCode = retryMeta.code;
 
         logError('AI', 'Erro no retry da OpenAI sem response_format.', {
           model,
@@ -249,7 +288,7 @@ async function callOpenAIJson(messages, options = {}) {
       error: apiError
     });
     return buildResult(null, {
-      code: baseErrorCode,
+      code: errorMeta.code,
       status,
       message
     });
