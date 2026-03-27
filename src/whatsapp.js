@@ -44,6 +44,14 @@ const CONVERSATION_STATE_TTL_SECONDS = 24 * 60 * 60;
 const ALERT_CONSUMPTION_THRESHOLDS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
+const APP_BASE_URL_ENV_CANDIDATES = [
+  'APP_BASE_URL',
+  'PUBLIC_APP_URL',
+  'PUBLIC_BASE_URL',
+  'RAILWAY_STATIC_URL',
+  'RENDER_EXTERNAL_URL',
+  'HEROKU_APP_URL'
+];
 const FRIENDLY_SUPPORT_MESSAGE = [
   'Desculpe, não consegui processar sua mensagem agora.',
   'Por favor, entre em contato com o administrador para suporte.'
@@ -112,6 +120,63 @@ async function getBaileysRuntime() {
 
 function getPairingNumber() {
   return String(process.env[PAIRING_NUMBER_ENV] || '').replace(/\D/g, '');
+}
+
+function getDashboardBaseUrl() {
+  for (const envName of APP_BASE_URL_ENV_CANDIDATES) {
+    const raw = String(process.env[envName] || '').trim();
+
+    if (!raw) {
+      continue;
+    }
+
+    const prefixed = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+
+    try {
+      const parsed = new URL(prefixed);
+
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        continue;
+      }
+
+      const normalizedPath = parsed.pathname && parsed.pathname !== '/'
+        ? parsed.pathname.replace(/\/+$/, '')
+        : '';
+
+      return `${parsed.protocol}//${parsed.host}${normalizedPath}`;
+    } catch (_error) {
+      // noop
+    }
+  }
+
+  return '';
+}
+
+function buildDashboardAccessMessage(userNumber) {
+  const safeUser = normalizeUserId(String(userNumber || ''));
+  const baseUrl = getDashboardBaseUrl();
+
+  if (!baseUrl) {
+    return [
+      'Seu painel web está habilitado, mas a URL pública ainda não foi configurada no servidor.',
+      'Peça ao administrador para definir APP_BASE_URL (ex: https://seu-app.herokuapp.com).',
+      '',
+      'Quando isso for configurado, use o comando: painel web'
+    ].join('\n');
+  }
+
+  const dashboardUrl = `${baseUrl}/web`;
+
+  return [
+    'Aqui está o link do seu painel web:',
+    dashboardUrl,
+    '',
+    'Login para acessar:',
+    `- usuário: ${safeUser}`,
+    `- senha: ${safeUser}`,
+    '',
+    'Se precisar do link novamente, envie: painel web'
+  ].join('\n');
 }
 
 function formatPairingCode(rawCode) {
@@ -407,6 +472,8 @@ function buildHelpMessage() {
     '- saldo do mes',
     '- listar gastos',
     '- listar gastos 20',
+    '- painel web',
+    '- link web',
     '',
     '4) Ajustar lançamentos',
     '- remover gasto <id>',
@@ -2113,6 +2180,28 @@ function isHelpCommand(commandText) {
   return /^(\/)?(ajuda|comandos?)\b/.test(commandText);
 }
 
+function isDashboardAccessCommand(commandText) {
+  return /^(\/)?(painel(\s+web)?|dashboard(\s+web)?|link\s+(do\s+)?(painel|dashboard|web)|acessar\s+(o\s+)?(painel|dashboard|web)|meu\s+painel(\s+web)?)\b/.test(commandText);
+}
+
+async function tryHandleDashboardAccess(sock, jid, userNumber, text) {
+  const commandText = normalizeCommandText(text);
+
+  if (!isDashboardAccessCommand(commandText)) {
+    return false;
+  }
+
+  const baseUrl = getDashboardBaseUrl();
+  await safeReply(sock, jid, buildDashboardAccessMessage(userNumber));
+
+  logInfo('WHATSAPP', 'Link do painel web solicitado pelo usuário.', {
+    user: userNumber,
+    dashboardUrlConfigured: Boolean(baseUrl)
+  });
+
+  return true;
+}
+
 function isSupportedDirectChat(jid) {
   if (!jid || typeof jid !== 'string') {
     return false;
@@ -2221,6 +2310,12 @@ async function processIncomingMessage(sock, message) {
 
     if (isHelpCommand(commandText)) {
       await safeReply(sock, jid, buildHelpMessage());
+      return;
+    }
+
+    const dashboardAccessHandled = await tryHandleDashboardAccess(sock, jid, userNumber, text);
+
+    if (dashboardAccessHandled) {
       return;
     }
 

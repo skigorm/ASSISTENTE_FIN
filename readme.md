@@ -9,6 +9,7 @@ Bot financeiro para WhatsApp com:
 - alertas de consumo automáticos
 - edição e remoção de despesas
 - painel de administração para habilitar/desabilitar acesso por usuário
+- painel web do usuário com gráficos, tabela de despesas e exportação Excel
 - persistência em Redis (Heroku) com fallback em arquivo
 
 ## Como funciona
@@ -55,6 +56,8 @@ Alertas de consumo são automáticos em faixas de `10% 20% ... 100%`, no total d
 - `saldo do mes`
 - `listar gastos`
 - `listar gastos 20`
+- `painel web` (envia link para acessar o dashboard no navegador)
+- `link web`
 - `remover gasto <id>`
 - `remover ultimo gasto`
 - `desfazer ultimo gasto`
@@ -93,6 +96,23 @@ Alertas de consumo são automáticos em faixas de `10% 20% ... 100%`, no total d
 
 Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 
+## Painel web do usuário (resumo financeiro)
+
+1. No WhatsApp, envie `painel web` para receber o link automaticamente.
+2. Faça login com:
+   - Usuário: número de telefone (somente dígitos)
+   - Senha: o mesmo número de telefone
+3. O painel mostra:
+   - KPIs do mês e acumulado
+   - gráfico de categorias do mês
+   - gráfico dos últimos meses
+   - tabela com todas as despesas
+4. Use o botão **Exportar Excel** para baixar planilha `.xls` com resumo e despesas.
+
+Regras de acesso:
+- usuário precisa existir no assistente (perfil ou despesas cadastradas)
+- se o acesso estiver desabilitado no `/admin`, o painel web também bloqueia login
+
 ## Variáveis de ambiente
 
 Use `.env.example` como base:
@@ -101,6 +121,7 @@ Use `.env.example` como base:
 - `OPENAI_MODEL=gpt-4o-mini` (opcional)
 - `OPENAI_VISION_MODEL=gpt-4o-mini` (opcional, para leitura de comprovante por imagem)
 - `WHATSAPP_PAIRING_NUMBER=55619...`
+- `APP_BASE_URL=https://seu-app.herokuapp.com` (necessária para o comando `painel web` enviar link completo)
 - `DISABLE_WHATSAPP_BOT=false`
 - `WHATSAPP_LOG_MESSAGES=true`
 - `WHATSAPP_LOG_IGNORED_MESSAGES=false`
@@ -152,6 +173,9 @@ App HTTP:
 - `GET /health` -> `{ "ok": true, "service": "finance-bot" }`
 - `GET /pairing` -> página de pareamento
 - `GET /pairing/status` -> status do WhatsApp
+- `GET /web` -> painel web para usuário final
+- `GET /web/api/dashboard` -> dados do dashboard (auth Basic com telefone:telefone)
+- `GET /web/api/dashboard/export` -> exportação Excel `.xls` (auth Basic com telefone:telefone)
 - `GET /admin` -> painel de gestão de usuários (com autenticação)
 - `GET /admin/api/users` -> lista usuários para o painel
 - `POST /admin/api/users/:user/access` -> habilita/desabilita acesso
