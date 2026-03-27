@@ -172,8 +172,9 @@ function buildDashboardAccessMessage(userNumber) {
     dashboardUrl,
     '',
     'Login para acessar:',
-    `- usuário: ${safeUser}`,
+    `- usuário: ${safeUser} (ID do seu usuário no bot)`,
     `- senha: ${safeUser}`,
+    '- use exatamente esse ID, mesmo que seu telefone seja diferente',
     '',
     'Se precisar do link novamente, envie: painel web'
   ].join('\n');

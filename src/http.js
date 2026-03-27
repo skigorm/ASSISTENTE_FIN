@@ -1397,26 +1397,26 @@ function buildDashboardPageHtml() {
     <section class="surface hero">
       <p class="eyebrow">Finance Bot Web</p>
       <h1>Resumo financeiro no navegador</h1>
-      <p class="hero-sub">Entre com seu telefone como usuário e senha para visualizar métricas, gráficos de gastos, tabela completa de despesas e exportar planilha de Excel.</p>
+      <p class="hero-sub">Entre com o identificador do seu usuário no bot (mesmo valor para usuário e senha) para visualizar métricas, gráficos de gastos, tabela completa de despesas e exportar planilha de Excel.</p>
     </section>
 
     <section id="login-panel" class="surface login">
       <form id="login-form">
         <div class="field-grid">
           <label class="field">
-            <span class="label">Usuário (telefone)</span>
-            <input id="login-user" class="input" type="text" autocomplete="username" placeholder="Ex: 5511999999999" />
+            <span class="label">Usuário (ID do bot)</span>
+            <input id="login-user" class="input" type="text" autocomplete="username" placeholder="Ex: 89245259673673" />
           </label>
           <label class="field">
-            <span class="label">Senha (telefone)</span>
-            <input id="login-pass" class="input" type="password" autocomplete="current-password" placeholder="Repita o mesmo telefone" />
+            <span class="label">Senha (mesmo ID)</span>
+            <input id="login-pass" class="input" type="password" autocomplete="current-password" placeholder="Repita o mesmo identificador" />
           </label>
         </div>
         <div class="actions" style="margin-top: 10px;">
           <button id="login-btn" class="btn btn-primary" type="submit">Entrar no painel</button>
         </div>
       </form>
-      <p class="hint">Use apenas números. Exemplo: <strong>5511999999999</strong>.</p>
+      <p class="hint">Use o mesmo ID enviado pelo comando <strong>painel web</strong> no WhatsApp.</p>
       <p id="auth-status" class="status is-hidden"></p>
     </section>
 
@@ -1557,7 +1557,7 @@ function buildDashboardPageHtml() {
       }).format(safe);
     }
 
-    function normalizePhone(value) {
+    function normalizeUserCredential(value) {
       return String(value || '').replace(/\\D/g, '');
     }
 
@@ -1680,7 +1680,6 @@ function buildDashboardPageHtml() {
         state.payload = payload;
         renderDashboard();
         showDashboard();
-        setDashboardStatus('');
       } finally {
         setBusy(false);
       }
@@ -1706,6 +1705,15 @@ function buildDashboardPageHtml() {
       renderMonthlyTimeline();
       refreshCategoryFilterOptions();
       renderRows();
+
+      if (!Number(summary.overallCount || 0)) {
+        setDashboardStatus(
+          'Nenhum dado encontrado para este ID. No WhatsApp, envie "painel web" e use o identificador informado na mensagem.',
+          false
+        );
+      } else {
+        setDashboardStatus('');
+      }
     }
 
     function renderCategoryChart() {
@@ -1973,16 +1981,16 @@ function buildDashboardPageHtml() {
       hideAuthStatus();
       setDashboardStatus('');
 
-      const username = normalizePhone(loginUserEl.value);
-      const password = normalizePhone(loginPassEl.value);
+      const username = normalizeUserCredential(loginUserEl.value);
+      const password = normalizeUserCredential(loginPassEl.value);
 
       if (!username || !password) {
-        setAuthStatus('Informe telefone em usuário e senha.', true);
+        setAuthStatus('Informe o ID do usuário em usuário e senha.', true);
         return;
       }
 
       if (username !== password) {
-        setAuthStatus('A senha deve ser igual ao telefone informado no usuário.', true);
+        setAuthStatus('A senha deve ser igual ao ID informado no usuário.', true);
         return;
       }
 
@@ -1997,7 +2005,7 @@ function buildDashboardPageHtml() {
         const code = error && error.message ? String(error.message) : 'request_failed';
         const map = {
           invalid_credentials: 'Credenciais inválidas.',
-          user_not_found: 'Usuário não encontrado no assistente.',
+          user_not_found: 'ID não encontrado. Envie "painel web" no WhatsApp para receber o ID correto.',
           access_disabled: 'Seu acesso ao assistente está desabilitado.'
         };
         setAuthStatus(map[code] || 'Falha ao autenticar no painel.', true);
@@ -2011,7 +2019,7 @@ function buildDashboardPageHtml() {
         const code = error && error.message ? String(error.message) : 'request_failed';
         const map = {
           invalid_credentials: 'Credenciais inválidas. Faça login novamente.',
-          user_not_found: 'Usuário não encontrado.',
+          user_not_found: 'ID não encontrado. Use o comando "painel web" no WhatsApp.',
           access_disabled: 'Acesso desabilitado para este usuário.'
         };
         setDashboardStatus(map[code] || 'Falha ao atualizar dados.', true);

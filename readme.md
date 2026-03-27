@@ -100,8 +100,8 @@ Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 
 1. No WhatsApp, envie `painel web` para receber o link automaticamente.
 2. Faça login com:
-   - Usuário: número de telefone (somente dígitos)
-   - Senha: o mesmo número de telefone
+   - Usuário: ID do usuário no bot (enviado no comando `painel web`)
+   - Senha: o mesmo ID do usuário
 3. O painel mostra:
    - KPIs do mês e acumulado
    - gráfico de categorias do mês
@@ -110,7 +110,7 @@ Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 4. Use o botão **Exportar Excel** para baixar planilha `.xls` com resumo e despesas.
 
 Regras de acesso:
-- no primeiro login web, o perfil do telefone é criado automaticamente
+- no primeiro login web, o perfil do ID informado é criado automaticamente
 - se o acesso estiver desabilitado no `/admin`, o painel web também bloqueia login
 
 ## Variáveis de ambiente
@@ -174,8 +174,8 @@ App HTTP:
 - `GET /pairing` -> página de pareamento
 - `GET /pairing/status` -> status do WhatsApp
 - `GET /web` -> painel web para usuário final
-- `GET /web/api/dashboard` -> dados do dashboard (auth Basic com telefone:telefone)
-- `GET /web/api/dashboard/export` -> exportação Excel `.xls` (auth Basic com telefone:telefone)
+- `GET /web/api/dashboard` -> dados do dashboard (auth Basic com usuario:usuario)
+- `GET /web/api/dashboard/export` -> exportação Excel `.xls` (auth Basic com usuario:usuario)
 - `GET /admin` -> painel de gestão de usuários (com autenticação)
 - `GET /admin/api/users` -> lista usuários para o painel
 - `POST /admin/api/users/:user/access` -> habilita/desabilita acesso

@@ -1,0 +1,28 @@
+{
+  "profiles": {
+    "5561983859831": {
+      "user": "5561983859831",
+      "name": "",
+      "accessEnabled": true,
+      "monthlyIncome": null,
+      "customCategories": [],
+      "budgetByCategory": {
+        "Alimentação": null,
+        "Transporte": null,
+        "Lazer": null,
+        "Outros": null
+      },
+      "alertThresholds": [
+        10,
+        20,
+        30
+      ],
+      "alertSent": {},
+      "onboardingComplete": false,
+      "createdAt": "2026-03-27T19:29:41.092Z",
+      "updatedAt": "2026-03-27T19:29:41.092Z",
+      "lastInteractionAt": "2026-03-27T19:29:41.092Z"
+    }
+  },
+  "states": {}
+}
