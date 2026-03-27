@@ -175,6 +175,44 @@ function normalizeCustomCategories(input) {
   return [...new Set(normalized)];
 }
 
+function normalizeUserAuthAlias(value) {
+  const raw = String(value || '').trim();
+
+  if (!raw) {
+    return '';
+  }
+
+  const base = raw.includes('@') ? raw.replace(/@.+$/, '') : raw;
+  const digits = base.replace(/\D/g, '');
+
+  if (digits.length < 8 || digits.length > 20) {
+    return '';
+  }
+
+  return digits;
+}
+
+function normalizeAuthAliases(input, user) {
+  const aliases = new Set();
+
+  const addAlias = (value) => {
+    const normalized = normalizeUserAuthAlias(value);
+
+    if (normalized) {
+      aliases.add(normalized);
+    }
+  };
+
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      addAlias(item);
+    }
+  }
+
+  addAlias(user);
+  return [...aliases];
+}
+
 function buildCategorySet(customCategories = []) {
   const categories = [...ALLOWED_CATEGORIES];
 
@@ -266,10 +304,12 @@ function normalizeUserProfileRecord(user, profile = {}) {
       .filter((item) => item && !ALLOWED_CATEGORIES.includes(item))
     : [];
   const customCategories = [...new Set([...customFromList, ...customFromBudgets])];
+  const authAliases = normalizeAuthAliases(profile.authAliases, safeUser);
 
   return {
     user: safeUser,
     name: sanitizeText(profile.name).slice(0, 80),
+    authAliases,
     accessEnabled: profile.accessEnabled !== false,
     monthlyIncome: Number.isFinite(monthlyIncome) && monthlyIncome > 0 ? roundTo2(monthlyIncome) : null,
     customCategories,
@@ -308,6 +348,7 @@ function normalizeConversationStateRecord(state) {
 function buildDefaultProfile(user) {
   return normalizeUserProfileRecord(user, {
     name: '',
+    authAliases: [],
     accessEnabled: true,
     monthlyIncome: null,
     customCategories: [],

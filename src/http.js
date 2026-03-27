@@ -207,6 +207,71 @@ function normalizeDashboardTransaction(record) {
   };
 }
 
+function normalizeDashboardAlias(value) {
+  const normalized = normalizeUserId(String(value || ''));
+
+  if (!normalized || normalized === 'desconhecido') {
+    return '';
+  }
+
+  if (normalized.length < 8 || normalized.length > 20) {
+    return '';
+  }
+
+  return normalized;
+}
+
+function extractProfileAuthAliases(profile) {
+  const aliases = new Set();
+
+  const addAlias = (value) => {
+    const normalized = normalizeDashboardAlias(value);
+
+    if (normalized) {
+      aliases.add(normalized);
+    }
+  };
+
+  if (profile && Array.isArray(profile.authAliases)) {
+    for (const item of profile.authAliases) {
+      addAlias(item);
+    }
+  }
+
+  addAlias(profile && profile.user);
+  return [...aliases];
+}
+
+function hasProfileMeaningfulData(profile) {
+  if (!profile || typeof profile !== 'object') {
+    return false;
+  }
+
+  if (sanitizeText(profile.name)) {
+    return true;
+  }
+
+  const monthlyIncome = Number(profile.monthlyIncome);
+
+  if (Number.isFinite(monthlyIncome) && monthlyIncome > 0) {
+    return true;
+  }
+
+  if (profile.onboardingComplete === true) {
+    return true;
+  }
+
+  if (Array.isArray(profile.customCategories) && profile.customCategories.length > 0) {
+    return true;
+  }
+
+  const budgets = profile.budgetByCategory && typeof profile.budgetByCategory === 'object'
+    ? Object.values(profile.budgetByCategory)
+    : [];
+
+  return budgets.some((item) => Number.isFinite(Number(item)) && Number(item) > 0);
+}
+
 function parseDashboardUserFromAuthHeader(headerValue) {
   const incoming = parseBasicAuthHeader(headerValue);
 
@@ -225,9 +290,9 @@ function parseDashboardUserFromAuthHeader(headerValue) {
 }
 
 async function resolveDashboardContextByUser(user) {
-  const safeUser = normalizeUserId(String(user || ''));
+  const loginAlias = normalizeDashboardAlias(String(user || ''));
 
-  if (!safeUser || safeUser === 'desconhecido') {
+  if (!loginAlias) {
     return {
       ok: false,
       statusCode: 401,
@@ -235,22 +300,73 @@ async function resolveDashboardContextByUser(user) {
     };
   }
 
-  const [profiles, rawTransactions] = await Promise.all([
-    listUserProfiles(),
-    getTransactionsByUser(safeUser)
-  ]);
+  const profiles = await listUserProfiles();
+  const safeProfiles = Array.isArray(profiles) ? profiles : [];
+  const exactProfile = safeProfiles.find((item) => normalizeDashboardAlias(item && item.user) === loginAlias) || null;
+  const aliasProfile = safeProfiles.find((item) => extractProfileAuthAliases(item).includes(loginAlias)) || null;
 
-  let profile = Array.isArray(profiles)
-    ? profiles.find((item) => sanitizeText(item.user) === safeUser) || null
-    : null;
-  const transactions = sortTransactionsByDateDesc(
-    (Array.isArray(rawTransactions) ? rawTransactions : [])
-      .map(normalizeDashboardTransaction)
+  const candidateUsers = [...new Set([
+    loginAlias,
+    normalizeDashboardAlias(exactProfile && exactProfile.user),
+    normalizeDashboardAlias(aliasProfile && aliasProfile.user)
+  ].filter(Boolean))];
+
+  const transactionsByUser = new Map();
+
+  await Promise.all(candidateUsers.map(async (candidateUser) => {
+    const rawTransactions = await getTransactionsByUser(candidateUser);
+    const normalizedTransactions = sortTransactionsByDateDesc(
+      (Array.isArray(rawTransactions) ? rawTransactions : [])
+        .map(normalizeDashboardTransaction)
+        .filter(Boolean)
+    );
+
+    transactionsByUser.set(candidateUser, normalizedTransactions);
+  }));
+
+  const profileCandidates = [...new Map(
+    [exactProfile, aliasProfile]
       .filter(Boolean)
-  );
+      .map((item) => [normalizeDashboardAlias(item.user), item])
+  ).values()]
+    .map((profile) => {
+      const profileUser = normalizeDashboardAlias(profile.user);
+      const transactions = transactionsByUser.get(profileUser) || [];
+
+      return {
+        profile,
+        profileUser,
+        transactionCount: transactions.length,
+        meaningful: hasProfileMeaningfulData(profile),
+        exact: profileUser === loginAlias
+      };
+    })
+    .sort((left, right) => {
+      if (left.transactionCount !== right.transactionCount) {
+        return right.transactionCount - left.transactionCount;
+      }
+
+      if (left.meaningful !== right.meaningful) {
+        return left.meaningful ? -1 : 1;
+      }
+
+      if (left.exact !== right.exact) {
+        return left.exact ? -1 : 1;
+      }
+
+      return left.profileUser.localeCompare(right.profileUser);
+    });
+
+  let profile = profileCandidates.length ? profileCandidates[0].profile : null;
+  let canonicalUser = profileCandidates.length ? profileCandidates[0].profileUser : loginAlias;
+  let transactions = transactionsByUser.get(canonicalUser) || [];
 
   if (!profile && transactions.length === 0) {
-    profile = await updateUserProfile(safeUser, {});
+    profile = await updateUserProfile(loginAlias, {
+      authAliases: [loginAlias]
+    });
+    canonicalUser = normalizeDashboardAlias(profile && profile.user) || loginAlias;
+    transactions = transactionsByUser.get(canonicalUser) || [];
   }
 
   if (profile && profile.accessEnabled === false) {
@@ -269,13 +385,25 @@ async function resolveDashboardContextByUser(user) {
     };
   }
 
+  if (profile) {
+    const existingAliases = extractProfileAuthAliases(profile);
+    const requiredAliases = [...new Set([loginAlias, canonicalUser].filter(Boolean))];
+    const missingAliases = requiredAliases.filter((alias) => !existingAliases.includes(alias));
+
+    if (missingAliases.length) {
+      profile = await updateUserProfile(canonicalUser, {
+        authAliases: [...existingAliases, ...missingAliases]
+      });
+    }
+  }
+
   return {
     ok: true,
-    user: safeUser,
+    user: canonicalUser,
     profile: profile
       ? {
         ...profile,
-        user: safeUser,
+        user: canonicalUser,
         name: sanitizeText(profile.name),
         accessEnabled: profile.accessEnabled !== false
       }
@@ -1397,26 +1525,26 @@ function buildDashboardPageHtml() {
     <section class="surface hero">
       <p class="eyebrow">Finance Bot Web</p>
       <h1>Resumo financeiro no navegador</h1>
-      <p class="hero-sub">Entre com o identificador do seu usuário no bot (mesmo valor para usuário e senha) para visualizar métricas, gráficos de gastos, tabela completa de despesas e exportar planilha de Excel.</p>
+      <p class="hero-sub">Entre com seu telefone ou ID do usuário no bot (mesmo valor para usuário e senha) para visualizar métricas, gráficos de gastos, tabela completa de despesas e exportar planilha de Excel.</p>
     </section>
 
     <section id="login-panel" class="surface login">
       <form id="login-form">
         <div class="field-grid">
           <label class="field">
-            <span class="label">Usuário (ID do bot)</span>
-            <input id="login-user" class="input" type="text" autocomplete="username" placeholder="Ex: 89245259673673" />
+            <span class="label">Usuário (telefone ou ID)</span>
+            <input id="login-user" class="input" type="text" autocomplete="username" placeholder="Ex: 5561983859831" />
           </label>
           <label class="field">
-            <span class="label">Senha (mesmo ID)</span>
-            <input id="login-pass" class="input" type="password" autocomplete="current-password" placeholder="Repita o mesmo identificador" />
+            <span class="label">Senha (mesmo valor)</span>
+            <input id="login-pass" class="input" type="password" autocomplete="current-password" placeholder="Repita o mesmo número/ID" />
           </label>
         </div>
         <div class="actions" style="margin-top: 10px;">
           <button id="login-btn" class="btn btn-primary" type="submit">Entrar no painel</button>
         </div>
       </form>
-      <p class="hint">Use o mesmo ID enviado pelo comando <strong>painel web</strong> no WhatsApp.</p>
+      <p class="hint">Use telefone ou ID enviado pelo comando <strong>painel web</strong> no WhatsApp.</p>
       <p id="auth-status" class="status is-hidden"></p>
     </section>
 
@@ -1559,6 +1687,15 @@ function buildDashboardPageHtml() {
 
     function normalizeUserCredential(value) {
       return String(value || '').replace(/\\D/g, '');
+    }
+
+    function getUserFromQueryParam() {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        return normalizeUserCredential(params.get('user') || '');
+      } catch (_error) {
+        return '';
+      }
     }
 
     function getDefaultMonth() {
@@ -1708,7 +1845,7 @@ function buildDashboardPageHtml() {
 
       if (!Number(summary.overallCount || 0)) {
         setDashboardStatus(
-          'Nenhum dado encontrado para este ID. No WhatsApp, envie "painel web" e use o identificador informado na mensagem.',
+          'Nenhum dado encontrado para este login. No WhatsApp, envie "painel web" e use telefone/ID informado na mensagem.',
           false
         );
       } else {
@@ -2005,7 +2142,7 @@ function buildDashboardPageHtml() {
         const code = error && error.message ? String(error.message) : 'request_failed';
         const map = {
           invalid_credentials: 'Credenciais inválidas.',
-          user_not_found: 'ID não encontrado. Envie "painel web" no WhatsApp para receber o ID correto.',
+          user_not_found: 'Login não encontrado. Envie "painel web" no WhatsApp para receber telefone/ID correto.',
           access_disabled: 'Seu acesso ao assistente está desabilitado.'
         };
         setAuthStatus(map[code] || 'Falha ao autenticar no painel.', true);
@@ -2019,7 +2156,7 @@ function buildDashboardPageHtml() {
         const code = error && error.message ? String(error.message) : 'request_failed';
         const map = {
           invalid_credentials: 'Credenciais inválidas. Faça login novamente.',
-          user_not_found: 'ID não encontrado. Use o comando "painel web" no WhatsApp.',
+          user_not_found: 'Login não encontrado. Use o comando "painel web" no WhatsApp.',
           access_disabled: 'Acesso desabilitado para este usuário.'
         };
         setDashboardStatus(map[code] || 'Falha ao atualizar dados.', true);
@@ -2056,15 +2193,22 @@ function buildDashboardPageHtml() {
 
     monthInputEl.value = getDefaultMonth();
 
+    const queryUser = getUserFromQueryParam();
     const persistedUser = sessionStorage.getItem(STORAGE_USER_KEY) || '';
     const persistedAuth = sessionStorage.getItem(STORAGE_AUTH_KEY) || '';
 
-    if (persistedUser) {
+    if (queryUser) {
+      clearPersistedAuth();
+      state.authHeader = '';
+      loginUserEl.value = queryUser;
+      loginPassEl.value = queryUser;
+      setAuthStatus('Login preenchido automaticamente pelo link. Clique em "Entrar no painel".', false);
+    } else if (persistedUser) {
       loginUserEl.value = persistedUser;
       loginPassEl.value = persistedUser;
     }
 
-    if (persistedAuth) {
+    if (!queryUser && persistedAuth) {
       state.authHeader = persistedAuth;
       safeRefresh().catch(() => null);
     }

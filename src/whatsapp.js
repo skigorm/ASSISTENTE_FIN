@@ -165,16 +165,16 @@ function buildDashboardAccessMessage(userNumber) {
     ].join('\n');
   }
 
-  const dashboardUrl = `${baseUrl}/web`;
+  const dashboardUrl = `${baseUrl}/web?user=${encodeURIComponent(safeUser)}`;
 
   return [
-    'Aqui está o link do seu painel web:',
+    'Aqui está o link do seu painel web (já com seu ID preenchido):',
     dashboardUrl,
     '',
     'Login para acessar:',
     `- usuário: ${safeUser} (ID do seu usuário no bot)`,
     `- senha: ${safeUser}`,
-    '- use exatamente esse ID, mesmo que seu telefone seja diferente',
+    '- se preferir, você pode usar seu telefone (quando já estiver vinculado ao seu ID)',
     '',
     'Se precisar do link novamente, envie: painel web'
   ].join('\n');
@@ -203,6 +203,104 @@ function normalizeCommandText(text) {
 
 function normalizeCategoryToken(text) {
   return normalizeCommandText(String(text || '')).replace(/\s+/g, ' ').trim();
+}
+
+function normalizeAuthAliasValue(value) {
+  const raw = String(value || '').trim();
+
+  if (!raw) {
+    return '';
+  }
+
+  const base = raw.includes('@') ? raw.replace(/@.+$/, '') : raw;
+  const digits = base.replace(/\D/g, '');
+
+  if (digits.length < 8 || digits.length > 20) {
+    return '';
+  }
+
+  return digits;
+}
+
+function mergeAuthAliases(...lists) {
+  const aliases = new Set();
+
+  for (const list of lists) {
+    if (!Array.isArray(list)) {
+      continue;
+    }
+
+    for (const item of list) {
+      const normalized = normalizeAuthAliasValue(item);
+
+      if (normalized) {
+        aliases.add(normalized);
+      }
+    }
+  }
+
+  return [...aliases];
+}
+
+function collectObservedUserAliases(message, jid) {
+  const aliases = new Set();
+
+  const addAlias = (value) => {
+    const raw = String(value || '').trim();
+
+    if (!raw) {
+      return;
+    }
+
+    const looksLikeJid = raw.includes('@');
+    const looksLikePhone = /^\+?\d[\d\s().-]{7,}$/.test(raw);
+
+    if (!looksLikeJid && !looksLikePhone) {
+      return;
+    }
+
+    const normalized = normalizeAuthAliasValue(raw);
+
+    if (normalized) {
+      aliases.add(normalized);
+    }
+  };
+
+  addAlias(jid);
+
+  const key = message && message.key && typeof message.key === 'object'
+    ? message.key
+    : null;
+
+  if (!key) {
+    return [...aliases];
+  }
+
+  const queue = [key];
+  const visited = new Set();
+
+  while (queue.length) {
+    const current = queue.shift();
+
+    if (!current || typeof current !== 'object' || visited.has(current)) {
+      continue;
+    }
+
+    visited.add(current);
+
+    for (const value of Object.values(current)) {
+      if (typeof value === 'string') {
+        addAlias(value);
+        continue;
+      }
+
+      if (value && typeof value === 'object') {
+        queue.push(value);
+      }
+    }
+  }
+
+  return [...aliases];
 }
 
 function getCustomCategories(profile) {
@@ -2192,7 +2290,15 @@ async function tryHandleDashboardAccess(sock, jid, userNumber, text) {
     return false;
   }
 
-  await updateUserProfile(userNumber, {});
+  await updateUserProfile(userNumber, (currentProfile) => {
+    const currentAliases = currentProfile && Array.isArray(currentProfile.authAliases)
+      ? currentProfile.authAliases
+      : [];
+
+    return {
+      authAliases: mergeAuthAliases(currentAliases, [userNumber])
+    };
+  });
   const baseUrl = getDashboardBaseUrl();
   await safeReply(sock, jid, buildDashboardAccessMessage(userNumber));
 
@@ -2262,6 +2368,10 @@ async function processIncomingMessage(sock, message) {
     const text = sanitizeText(rawText);
 
     const userNumber = normalizeUserId(jid);
+    const observedAliases = mergeAuthAliases(
+      collectObservedUserAliases(message, jid),
+      [userNumber]
+    );
 
     const referenceDate = new Date();
     const commandText = normalizeCommandText(text);
@@ -2269,7 +2379,21 @@ async function processIncomingMessage(sock, message) {
     let profile = await getUserProfile(userNumber);
 
     if (!profile) {
-      profile = await updateUserProfile(userNumber, {});
+      profile = await updateUserProfile(userNumber, {
+        authAliases: observedAliases
+      });
+    } else {
+      const currentAliases = Array.isArray(profile.authAliases) ? profile.authAliases : [];
+      const mergedAliases = mergeAuthAliases(currentAliases, observedAliases);
+      const normalizedCurrentAliases = mergeAuthAliases(currentAliases);
+      const hasAliasChange = mergedAliases.length !== normalizedCurrentAliases.length
+        || mergedAliases.some((alias) => !normalizedCurrentAliases.includes(alias));
+
+      if (hasAliasChange) {
+        profile = await updateUserProfile(userNumber, {
+          authAliases: mergedAliases
+        });
+      }
     }
 
     if (profile.accessEnabled === false) {

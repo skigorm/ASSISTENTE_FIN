@@ -99,9 +99,10 @@ Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 ## Painel web do usuário (resumo financeiro)
 
 1. No WhatsApp, envie `painel web` para receber o link automaticamente.
+   - o link já chega com seu ID preenchido no login
 2. Faça login com:
-   - Usuário: ID do usuário no bot (enviado no comando `painel web`)
-   - Senha: o mesmo ID do usuário
+   - Usuário: telefone ou ID do usuário no bot
+   - Senha: o mesmo valor informado no usuário
 3. O painel mostra:
    - KPIs do mês e acumulado
    - gráfico de categorias do mês
@@ -110,7 +111,8 @@ Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 4. Use o botão **Exportar Excel** para baixar planilha `.xls` com resumo e despesas.
 
 Regras de acesso:
-- no primeiro login web, o perfil do ID informado é criado automaticamente
+- o sistema relaciona telefone e ID do usuário para buscar os dados corretos no web
+- no primeiro login web, se o usuário ainda não existir, o perfil é criado automaticamente
 - se o acesso estiver desabilitado no `/admin`, o painel web também bloqueia login
 
 ## Variáveis de ambiente
