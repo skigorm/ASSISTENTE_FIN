@@ -2191,6 +2191,7 @@ async function tryHandleDashboardAccess(sock, jid, userNumber, text) {
     return false;
   }
 
+  await updateUserProfile(userNumber, {});
   const baseUrl = getDashboardBaseUrl();
   await safeReply(sock, jid, buildDashboardAccessMessage(userNumber));
 

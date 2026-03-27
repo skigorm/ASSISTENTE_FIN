@@ -3,7 +3,8 @@ const { timingSafeEqual } = require('crypto');
 const {
   getTransactionsByUser,
   listUserProfiles,
-  setUserAccessEnabled
+  setUserAccessEnabled,
+  updateUserProfile
 } = require('./storage');
 const { logError, logInfo, normalizeUserId, sanitizeText } = require('./utils');
 const { getWhatsAppState } = require('./whatsappState');
@@ -239,7 +240,7 @@ async function resolveDashboardContextByUser(user) {
     getTransactionsByUser(safeUser)
   ]);
 
-  const profile = Array.isArray(profiles)
+  let profile = Array.isArray(profiles)
     ? profiles.find((item) => sanitizeText(item.user) === safeUser) || null
     : null;
   const transactions = sortTransactionsByDateDesc(
@@ -247,6 +248,10 @@ async function resolveDashboardContextByUser(user) {
       .map(normalizeDashboardTransaction)
       .filter(Boolean)
   );
+
+  if (!profile && transactions.length === 0) {
+    profile = await updateUserProfile(safeUser, {});
+  }
 
   if (profile && profile.accessEnabled === false) {
     return {

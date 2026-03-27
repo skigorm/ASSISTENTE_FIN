@@ -110,7 +110,7 @@ Quando desabilitado, o usuário recebe mensagem de acesso bloqueado no WhatsApp.
 4. Use o botão **Exportar Excel** para baixar planilha `.xls` com resumo e despesas.
 
 Regras de acesso:
-- usuário precisa existir no assistente (perfil ou despesas cadastradas)
+- no primeiro login web, o perfil do telefone é criado automaticamente
 - se o acesso estiver desabilitado no `/admin`, o painel web também bloqueia login
 
 ## Variáveis de ambiente
