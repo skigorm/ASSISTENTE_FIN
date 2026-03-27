@@ -1094,12 +1094,17 @@ function buildDashboardPageHtml() {
       --danger: #be123c;
       --shadow: 0 18px 50px rgba(15, 23, 42, 0.12);
     }
+    html {
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+    }
     * {
       box-sizing: border-box;
     }
     body {
       margin: 0;
       min-height: 100vh;
+      overflow-x: hidden;
       font-family: "Avenir Next", "Montserrat", "Segoe UI", sans-serif;
       color: var(--ink);
       background:
@@ -1110,11 +1115,14 @@ function buildDashboardPageHtml() {
     }
     .shell {
       max-width: 1120px;
+      width: 100%;
+      min-width: 0;
       margin: 0 auto;
       display: grid;
       gap: 18px;
     }
     .surface {
+      min-width: 0;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 20px;
@@ -1157,6 +1165,7 @@ function buildDashboardPageHtml() {
     .field {
       display: grid;
       gap: 6px;
+      min-width: 0;
     }
     .label {
       font-size: 12px;
@@ -1167,10 +1176,11 @@ function buildDashboardPageHtml() {
     }
     .input {
       width: 100%;
+      min-width: 0;
       border: 1px solid #bfccd9;
       border-radius: 12px;
       padding: 11px 12px;
-      font-size: 14px;
+      font-size: 16px;
       font-family: "Avenir Next", "Montserrat", "Segoe UI", sans-serif;
       background: #fbfdff;
       color: var(--ink);
@@ -1242,11 +1252,17 @@ function buildDashboardPageHtml() {
       display: grid;
       gap: 14px;
     }
+    .dashboard > * {
+      min-width: 0;
+    }
     .toolbar {
       display: grid;
       grid-template-columns: 1.2fr minmax(170px, 200px) auto auto auto;
       gap: 8px;
       align-items: end;
+    }
+    .toolbar > * {
+      min-width: 0;
     }
     .welcome {
       font-size: 14px;
@@ -1435,6 +1451,8 @@ function buildDashboardPageHtml() {
       margin-bottom: 10px;
     }
     .table-wrap {
+      width: 100%;
+      max-width: 100%;
       border: 1px solid #e2e8f0;
       border-radius: 10px;
       overflow: auto;
@@ -1502,6 +1520,9 @@ function buildDashboardPageHtml() {
       }
     }
     @media (max-width: 640px) {
+      body {
+        padding: 18px 10px 26px;
+      }
       .field-grid {
         grid-template-columns: 1fr;
       }
@@ -1524,7 +1545,7 @@ function buildDashboardPageHtml() {
   <main class="shell">
     <section class="surface hero">
       <p class="eyebrow">Finance Bot Web</p>
-      <h1>Resumo financeiro no navegador</h1>
+      <h1>Resumo financeiro WEB</h1>
       <p class="hero-sub">Entre com seu telefone ou ID do usuário no bot (mesmo valor para usuário e senha) para visualizar métricas, gráficos de gastos, tabela completa de despesas e exportar planilha de Excel.</p>
     </section>
 
