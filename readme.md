@@ -3,6 +3,7 @@
 Bot financeiro para WhatsApp com:
 - registro de gastos por linguagem natural
 - leitura de comprovante por foto (imagem)
+- registro de gasto por áudio (transcrição + confirmação)
 - onboarding de novos usuários
 - perfil financeiro (nome, renda, orçamento por categoria)
 - categorias personalizadas (ex: obra, dízimo, água, luz, alarme)
@@ -26,6 +27,13 @@ Também aceita foto de comprovante:
 2. O bot extrai valor/categoria/descrição/data via OpenAI.
 3. Mostra prévia e pergunta: `Deseja salvar esse gasto? (sim/não)`.
 4. Usuário confirma (`sim`) ou corrige em texto (`valor 45 categoria alimentação`) antes de salvar.
+
+Também aceita áudio:
+1. Usuário envia áudio/voz descrevendo o gasto.
+2. O bot transcreve via OpenAI.
+3. Interpreta valor/categoria/descrição/data usando o mesmo parser de texto.
+4. Mostra prévia e pergunta: `Deseja salvar esse gasto? (sim/não)`.
+5. Usuário confirma (`sim`) ou corrige em texto antes de salvar.
 
 ## Fluxo de primeiro uso (onboarding)
 
@@ -75,6 +83,7 @@ Alertas de consumo são automáticos em faixas de `10% 20% ... 100%`, no total d
 - `alertas` (mostra como funcionam os alertas automáticos)
 - `reconfigurar perfil`
 - enviar foto do comprovante + responder `sim` para salvar
+- enviar áudio descrevendo gasto + responder `sim` para salvar
 
 ## Pareamento (código, sem QR)
 
@@ -122,6 +131,8 @@ Use `.env.example` como base:
 - `OPENAI_KEY=...`
 - `OPENAI_MODEL=gpt-4o-mini` (opcional)
 - `OPENAI_VISION_MODEL=gpt-4o-mini` (opcional, para leitura de comprovante por imagem)
+- `OPENAI_AUDIO_MODEL=gpt-4o-mini-transcribe` (opcional, para transcrição de áudio)
+- `OPENAI_AUDIO_FALLBACK_MODEL=whisper-1` (opcional, fallback para áudio)
 - `WHATSAPP_PAIRING_NUMBER=55619...`
 - `APP_BASE_URL=https://seu-app.herokuapp.com` (necessária para o comando `painel web` enviar link completo)
 - `DISABLE_WHATSAPP_BOT=false`

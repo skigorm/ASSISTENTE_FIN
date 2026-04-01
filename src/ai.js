@@ -20,6 +20,9 @@ const {
 } = require('./utils');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+const OPENAI_AUDIO_TRANSCRIPT_URL = 'https://api.openai.com/v1/audio/transcriptions';
+const DEFAULT_AUDIO_TRANSCRIPTION_MODEL = 'gpt-4o-mini-transcribe';
+const DEFAULT_AUDIO_FALLBACK_MODEL = 'whisper-1';
 
 function normalizeAssistantContent(content) {
   if (typeof content === 'string') {
@@ -86,6 +89,48 @@ function sleep(ms) {
   });
 }
 
+function getErrorMessageFromApiError(apiError, fallbackMessage = '') {
+  return sanitizeText(
+    String(
+      apiError && typeof apiError === 'object'
+        ? apiError.message || JSON.stringify(apiError)
+        : apiError || fallbackMessage || ''
+    )
+  );
+}
+
+function mapOpenAIErrorCode(status, message, errorType = '', errorCode = '', requestCode = '') {
+  if (requestCode === 'ECONNABORTED' || requestCode === 'ERR_CANCELED') {
+    return 'openai_timeout';
+  }
+
+  if (status === 401 || status === 403) {
+    return 'openai_auth_failed';
+  }
+
+  if (status === 429) {
+    if (
+      /insufficient[_\s-]?quota/.test(errorType) ||
+      /insufficient[_\s-]?quota/.test(errorCode) ||
+      /insufficient quota|quota exceeded|billing/i.test(message)
+    ) {
+      return 'openai_quota_exceeded';
+    }
+
+    return 'openai_rate_limit';
+  }
+
+  if (status === 400) {
+    return 'openai_bad_request';
+  }
+
+  if (Number.isFinite(status) && status >= 500) {
+    return 'openai_server_error';
+  }
+
+  return 'openai_request_failed';
+}
+
 function buildOpenAIErrorMeta(error) {
   const status = error && error.response ? error.response.status : undefined;
   const apiError = error && error.response && error.response.data
@@ -93,37 +138,10 @@ function buildOpenAIErrorMeta(error) {
     : error && error.message
       ? error.message
       : '';
-  const message = sanitizeText(
-    String(
-      apiError && typeof apiError === 'object'
-        ? apiError.message || JSON.stringify(apiError)
-        : apiError || ''
-    )
-  );
+  const message = getErrorMessageFromApiError(apiError, error && error.message ? error.message : '');
   const errorType = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.type : '')).toLowerCase();
   const errorCode = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.code : '')).toLowerCase();
-
-  let code = 'openai_request_failed';
-
-  if (error && error.code === 'ECONNABORTED') {
-    code = 'openai_timeout';
-  } else if (status === 401 || status === 403) {
-    code = 'openai_auth_failed';
-  } else if (status === 429) {
-    if (
-      /insufficient[_\s-]?quota/.test(errorType) ||
-      /insufficient[_\s-]?quota/.test(errorCode) ||
-      /insufficient quota|quota exceeded|billing/i.test(message)
-    ) {
-      code = 'openai_quota_exceeded';
-    } else {
-      code = 'openai_rate_limit';
-    }
-  } else if (status === 400) {
-    code = 'openai_bad_request';
-  } else if (Number.isFinite(status) && status >= 500) {
-    code = 'openai_server_error';
-  }
+  const code = mapOpenAIErrorCode(status, message, errorType, errorCode, error && error.code ? String(error.code) : '');
 
   return {
     code,
@@ -131,6 +149,185 @@ function buildOpenAIErrorMeta(error) {
     message,
     apiError
   };
+}
+
+function buildOpenAIErrorMetaFromResponse(status, payload) {
+  const apiError = payload && typeof payload === 'object'
+    ? payload.error || payload
+    : payload;
+  const message = getErrorMessageFromApiError(apiError, typeof payload === 'string' ? payload : '');
+  const errorType = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.type : '')).toLowerCase();
+  const errorCode = sanitizeText(String(apiError && typeof apiError === 'object' ? apiError.code : '')).toLowerCase();
+  const code = mapOpenAIErrorCode(status, message, errorType, errorCode);
+
+  return {
+    code,
+    status,
+    message,
+    apiError
+  };
+}
+
+function normalizeAudioMimeType(mimeType) {
+  const safeMimeType = sanitizeText(String(mimeType || '')).toLowerCase();
+  return /^audio\/[a-z0-9.+-]+$/.test(safeMimeType) ? safeMimeType : 'audio/ogg';
+}
+
+function getAudioFileExtension(mimeType) {
+  const map = {
+    'audio/ogg': 'ogg',
+    'audio/ogg; codecs=opus': 'ogg',
+    'audio/mpeg': 'mp3',
+    'audio/mp3': 'mp3',
+    'audio/mp4': 'm4a',
+    'audio/x-m4a': 'm4a',
+    'audio/wav': 'wav',
+    'audio/x-wav': 'wav',
+    'audio/webm': 'webm',
+    'audio/aac': 'aac',
+    'audio/flac': 'flac'
+  };
+
+  const normalized = normalizeAudioMimeType(mimeType);
+
+  if (map[normalized]) {
+    return map[normalized];
+  }
+
+  const subtype = normalized.split('/')[1];
+  return sanitizeText(String(subtype || 'ogg').replace(/[^a-z0-9]/gi, '')) || 'ogg';
+}
+
+async function readResponsePayload(response) {
+  if (!response || typeof response !== 'object') {
+    return null;
+  }
+
+  try {
+    return await response.json();
+  } catch (_error) {
+    try {
+      return await response.text();
+    } catch (_secondError) {
+      return null;
+    }
+  }
+}
+
+async function requestAudioTranscriptionWithModel(audioBuffer, mimeType, model, options = {}) {
+  if (!process.env.OPENAI_KEY) {
+    return {
+      transcript: null,
+      error: {
+        code: 'openai_key_missing',
+        message: 'OPENAI_KEY não configurada.'
+      }
+    };
+  }
+
+  const safeModel = sanitizeText(model || DEFAULT_AUDIO_TRANSCRIPTION_MODEL) || DEFAULT_AUDIO_TRANSCRIPTION_MODEL;
+  const finalMimeType = normalizeAudioMimeType(mimeType);
+  const extension = getAudioFileExtension(finalMimeType);
+  const timeout = Number.isFinite(Number(options.timeout)) && Number(options.timeout) > 0
+    ? Number(options.timeout)
+    : 45000;
+  const language = sanitizeText(options.language || process.env.OPENAI_AUDIO_LANGUAGE || 'pt');
+  const prompt = sanitizeText(options.prompt || '');
+
+  const formData = new FormData();
+  const audioBlob = new Blob([audioBuffer], { type: finalMimeType });
+  formData.append('file', audioBlob, `audio.${extension}`);
+  formData.append('model', safeModel);
+  formData.append('response_format', 'json');
+
+  if (language) {
+    formData.append('language', language);
+  }
+
+  if (prompt) {
+    formData.append('prompt', prompt);
+  }
+
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => {
+    controller.abort();
+  }, timeout);
+
+  try {
+    const response = await fetch(
+      OPENAI_AUDIO_TRANSCRIPT_URL,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_KEY}`
+        },
+        body: formData,
+        signal: controller.signal
+      }
+    );
+    const payload = await readResponsePayload(response);
+
+    if (!response.ok) {
+      return {
+        transcript: null,
+        error: buildOpenAIErrorMetaFromResponse(response.status, payload)
+      };
+    }
+
+    const transcript = sanitizeText(
+      typeof payload === 'string'
+        ? payload
+        : String(
+          payload && typeof payload === 'object'
+            ? payload.text || payload.transcript || payload.output_text || ''
+            : ''
+        )
+    );
+
+    if (!transcript) {
+      return {
+        transcript: null,
+        error: {
+          code: 'openai_non_json_response',
+          status: response.status,
+          message: sanitizeText(typeof payload === 'string' ? payload : JSON.stringify(payload || {}))
+        }
+      };
+    }
+
+    return {
+      transcript,
+      error: null
+    };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      return {
+        transcript: null,
+        error: {
+          code: 'openai_timeout',
+          message: 'Timeout na transcrição de áudio.'
+        }
+      };
+    }
+
+    return {
+      transcript: null,
+      error: {
+        code: 'openai_request_failed',
+        message: sanitizeText(error && error.message ? error.message : 'Falha de rede na transcrição de áudio.')
+      }
+    };
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function shouldRetryAudioRateLimit(errorCode) {
+  return errorCode === 'openai_rate_limit';
+}
+
+function shouldTryAudioFallbackModel(errorCode) {
+  return !['openai_key_missing', 'openai_auth_failed', 'openai_quota_exceeded'].includes(errorCode);
 }
 
 async function callOpenAIJson(messages, options = {}) {
@@ -851,8 +1048,95 @@ async function parseReceiptWithAI(
   };
 }
 
+async function transcribeAudioWithAI(audioBuffer, mimeType = 'audio/ogg', options = {}) {
+  if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    return {
+      errorCode: 'audio_invalid_input',
+      errorMessage: 'Áudio vazio ou inválido.'
+    };
+  }
+
+  const configuredAudioModel = sanitizeText(
+    options.model || process.env.OPENAI_AUDIO_MODEL || DEFAULT_AUDIO_TRANSCRIPTION_MODEL
+  ) || DEFAULT_AUDIO_TRANSCRIPTION_MODEL;
+  const fallbackAudioModel = sanitizeText(
+    options.fallbackModel || process.env.OPENAI_AUDIO_FALLBACK_MODEL || DEFAULT_AUDIO_FALLBACK_MODEL
+  ) || DEFAULT_AUDIO_FALLBACK_MODEL;
+  const maxRateLimitRetries = Number.isFinite(Number(options.maxRateLimitRetries))
+    ? Math.max(0, Math.min(3, Number(options.maxRateLimitRetries)))
+    : 2;
+
+  const requestModel = async (model) => {
+    for (let attempt = 0; attempt <= maxRateLimitRetries; attempt += 1) {
+      const result = await requestAudioTranscriptionWithModel(
+        audioBuffer,
+        mimeType,
+        model,
+        options
+      );
+      const errorCode = sanitizeText(result && result.error && result.error.code);
+
+      if (!errorCode || !shouldRetryAudioRateLimit(errorCode) || attempt >= maxRateLimitRetries) {
+        return result;
+      }
+
+      const waitMs = 1200 * (attempt + 1);
+      logWarn('AI', 'Rate limit temporário na transcrição de áudio. Aguardando retry automático.', {
+        model,
+        attempt: attempt + 1,
+        waitMs
+      });
+      await sleep(waitMs);
+    }
+
+    return {
+      transcript: null,
+      error: {
+        code: 'openai_request_failed',
+        message: 'Falha ao transcrever áudio após retentativas.'
+      }
+    };
+  };
+
+  const firstAttempt = await requestModel(configuredAudioModel);
+  let transcript = sanitizeText(firstAttempt && firstAttempt.transcript);
+  let lastError = firstAttempt && firstAttempt.error ? firstAttempt.error : null;
+
+  if (
+    !transcript &&
+    fallbackAudioModel &&
+    fallbackAudioModel !== configuredAudioModel &&
+    shouldTryAudioFallbackModel(sanitizeText(lastError && lastError.code))
+  ) {
+    logWarn('AI', 'Primeira tentativa de transcrição de áudio falhou. Tentando fallback de modelo.', {
+      configuredAudioModel,
+      fallbackAudioModel
+    });
+
+    const fallbackAttempt = await requestModel(fallbackAudioModel);
+    transcript = sanitizeText(fallbackAttempt && fallbackAttempt.transcript);
+    lastError = fallbackAttempt && fallbackAttempt.error ? fallbackAttempt.error : lastError;
+  }
+
+  if (!transcript) {
+    return {
+      errorCode: sanitizeText(lastError && lastError.code),
+      errorStatus: lastError && Number.isFinite(Number(lastError.status))
+        ? Number(lastError.status)
+        : null,
+      errorMessage: sanitizeText(lastError && lastError.message)
+    };
+  }
+
+  logInfo('AI', 'Áudio transcrito com sucesso pela OpenAI.');
+  return {
+    transcript
+  };
+}
+
 module.exports = {
   parseReceiptWithAI,
   parseTransactionPatchWithAI,
-  parseTransactionWithAI
+  parseTransactionWithAI,
+  transcribeAudioWithAI
 };

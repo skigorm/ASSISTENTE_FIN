@@ -2,7 +2,8 @@ const { loadWhatsAppAuthState } = require('./auth');
 const {
   parseReceiptWithAI,
   parseTransactionPatchWithAI,
-  parseTransactionWithAI
+  parseTransactionWithAI,
+  transcribeAudioWithAI
 } = require('./ai');
 const {
   clearConversationState,
@@ -42,6 +43,8 @@ const {
 const RECONNECT_DELAY_MS = 5000;
 const CONVERSATION_STATE_TTL_SECONDS = 24 * 60 * 60;
 const ALERT_CONSUMPTION_THRESHOLDS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+const AUDIO_MAX_SIZE_BYTES = 20 * 1024 * 1024;
+const AUDIO_MAX_DURATION_SECONDS = 3 * 60;
 
 const PAIRING_NUMBER_ENV = 'WHATSAPP_PAIRING_NUMBER';
 const APP_BASE_URL_ENV_CANDIDATES = [
@@ -500,7 +503,74 @@ function extractImageMessage(messageContent) {
   return null;
 }
 
-async function downloadImageBuffer(sock, message) {
+function extractAudioMessage(messageContent) {
+  const content = unwrapMessageContent(messageContent);
+
+  if (!content) {
+    return null;
+  }
+
+  if (content.audioMessage) {
+    return content.audioMessage;
+  }
+
+  if (
+    content.documentMessage &&
+    typeof content.documentMessage.mimetype === 'string' &&
+    content.documentMessage.mimetype.startsWith('audio/')
+  ) {
+    return content.documentMessage;
+  }
+
+  return null;
+}
+
+function parseMediaLengthBytes(mediaMessage) {
+  if (!mediaMessage || typeof mediaMessage !== 'object') {
+    return Number.NaN;
+  }
+
+  const raw = mediaMessage.fileLength;
+
+  if (Number.isFinite(Number(raw))) {
+    return Number(raw);
+  }
+
+  if (raw && typeof raw === 'object') {
+    if (Number.isFinite(Number(raw.low)) && Number.isFinite(Number(raw.high))) {
+      return Number(raw.high) * 4294967296 + Number(raw.low >>> 0);
+    }
+
+    if (typeof raw.toString === 'function') {
+      const parsed = Number(raw.toString());
+
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return Number.NaN;
+}
+
+function parseAudioDurationSeconds(audioMessage) {
+  if (!audioMessage || typeof audioMessage !== 'object') {
+    return Number.NaN;
+  }
+
+  const rawDuration = audioMessage.seconds !== undefined
+    ? audioMessage.seconds
+    : audioMessage.duration;
+  const duration = Number(rawDuration);
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return Number.NaN;
+  }
+
+  return Math.round(duration);
+}
+
+async function downloadMediaBuffer(sock, message, mediaTypeLabel = 'mídia') {
   try {
     const { downloadMediaMessage } = await getBaileysRuntime();
 
@@ -533,9 +603,17 @@ async function downloadImageBuffer(sock, message) {
 
     return null;
   } catch (error) {
-    logError('WHATSAPP', 'Falha ao baixar imagem da mensagem.', error.message);
+    logError('WHATSAPP', `Falha ao baixar ${mediaTypeLabel} da mensagem.`, error.message);
     return null;
   }
+}
+
+async function downloadImageBuffer(sock, message) {
+  return downloadMediaBuffer(sock, message, 'imagem');
+}
+
+async function downloadAudioBuffer(sock, message) {
+  return downloadMediaBuffer(sock, message, 'áudio');
 }
 
 async function safeReply(sock, jid, text) {
@@ -561,7 +639,11 @@ function buildHelpMessage() {
     '- envie a foto da despesa/comprovante',
     '- opcional: envie legenda para ajudar (ex: "valor 45 categoria alimentação hoje")',
     '',
-    '3) Consultar seus números',
+    '3) Registrar gasto por áudio',
+    '- envie áudio/voz descrevendo o gasto (ex: "gastei 35 no uber hoje")',
+    '- o bot transcreve e pede confirmação antes de salvar',
+    '',
+    '4) Consultar seus números',
     '- resumo do mes',
     '- resumo 03/2026',
     '- total por categoria',
@@ -574,13 +656,13 @@ function buildHelpMessage() {
     '- painel web',
     '- link web',
     '',
-    '4) Ajustar lançamentos',
+    '5) Ajustar lançamentos',
     '- remover gasto <id>',
     '- remover ultimo gasto',
     '- editar gasto <id> para 45 no mercado ontem',
     '- desfazer ultimo gasto',
     '',
-    '5) Perfil, categorias e orçamento',
+    '6) Perfil, categorias e orçamento',
     '- meu perfil',
     '- categorias | listar categorias',
     '- criar categoria obra',
@@ -1850,6 +1932,91 @@ async function tryHandleEditExpense(sock, jid, userNumber, text, referenceDate, 
   return true;
 }
 
+async function handleAudioConfirmationFlow(sock, jid, userNumber, text, referenceDate, profile, conversationState) {
+  if (!conversationState || conversationState.step !== 'audio_confirm') {
+    return false;
+  }
+
+  const pending = conversationState.data && conversationState.data.transaction;
+
+  if (!pending || typeof pending !== 'object') {
+    await clearConversationState(userNumber);
+    return false;
+  }
+
+  const yesNo = parseYesNo(text);
+
+  if (yesNo === true) {
+    await clearConversationState(userNumber);
+
+    const saveResult = await saveTransaction(userNumber, pending);
+
+    if (saveResult.duplicate) {
+      await safeReply(sock, jid, 'Esse gasto já tinha sido registrado.');
+      return true;
+    }
+
+    await notifySavedTransaction(sock, jid, userNumber, profile, saveResult.record);
+    return true;
+  }
+
+  if (yesNo === false) {
+    await clearConversationState(userNumber);
+    await safeReply(
+      sock,
+      jid,
+      [
+        'Certo, não salvei esse áudio.',
+        'Se quiser, pode mandar outro áudio, foto ou texto com o gasto.'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  const patch = await parseUpdatePatch(text, referenceDate, getCustomCategories(profile));
+
+  if (!patch) {
+    await safeReply(
+      sock,
+      jid,
+      'Me responde com *sim* ou *não*. Se quiser ajustar, pode escrever: "valor 45 categoria alimentação".'
+    );
+    return true;
+  }
+
+  const adjusted = {
+    ...pending,
+    ...patch
+  };
+
+  await setConversationState(
+    userNumber,
+    {
+      step: 'audio_confirm',
+      data: {
+        transaction: adjusted,
+        transcript: sanitizeText(conversationState.data && conversationState.data.transcript)
+      }
+    },
+    CONVERSATION_STATE_TTL_SECONDS
+  );
+
+  await safeReply(
+    sock,
+    jid,
+    [
+      'Atualizei os dados do áudio:',
+      `• Valor: ${formatCurrencyBRL(adjusted.valor)}`,
+      `• Categoria: ${adjusted.categoria}`,
+      `• Descrição: ${adjusted.descricao}`,
+      `• Data: ${formatDateBR(adjusted.data)}`,
+      '',
+      'Salvar agora? (sim/não)'
+    ].join('\n')
+  );
+  return true;
+}
+
 async function handleReceiptConfirmationFlow(sock, jid, userNumber, text, referenceDate, profile, conversationState) {
   if (!conversationState || conversationState.step !== 'receipt_confirm') {
     return false;
@@ -1999,6 +2166,128 @@ async function tryHandleReceiptImage(sock, jid, userNumber, message, imageMessag
   return true;
 }
 
+async function tryHandleAudioExpense(sock, jid, userNumber, message, audioMessage, text, referenceDate, profile) {
+  if (!audioMessage) {
+    return false;
+  }
+
+  const audioLengthBytes = parseMediaLengthBytes(audioMessage);
+
+  if (Number.isFinite(audioLengthBytes) && audioLengthBytes > AUDIO_MAX_SIZE_BYTES) {
+    await safeReply(
+      sock,
+      jid,
+      'Esse áudio está muito grande para processar. Envie um áudio menor (até 20MB).'
+    );
+    return true;
+  }
+
+  const audioDurationSeconds = parseAudioDurationSeconds(audioMessage);
+
+  if (Number.isFinite(audioDurationSeconds) && audioDurationSeconds > AUDIO_MAX_DURATION_SECONDS) {
+    await safeReply(
+      sock,
+      jid,
+      'Esse áudio ficou longo demais para lançamento automático. Tente um áudio de até 3 minutos.'
+    );
+    return true;
+  }
+
+  const audioBuffer = await downloadAudioBuffer(sock, message);
+
+  if (!audioBuffer || audioBuffer.length === 0) {
+    await safeReply(
+      sock,
+      jid,
+      'Não consegui baixar seu áudio. Tenta enviar novamente, por favor.'
+    );
+    return true;
+  }
+
+  const customCategories = getCustomCategories(profile);
+  const mimeType = sanitizeText(audioMessage.mimetype || 'audio/ogg');
+  const transcriptionResult = await transcribeAudioWithAI(audioBuffer, mimeType);
+  const transcript = sanitizeText(transcriptionResult && transcriptionResult.transcript);
+
+  if (!transcript) {
+    const errorCode = sanitizeText(transcriptionResult && transcriptionResult.errorCode);
+    const errorStatus = transcriptionResult && Number.isFinite(Number(transcriptionResult.errorStatus))
+      ? Number(transcriptionResult.errorStatus)
+      : null;
+    const errorMessage = sanitizeText(transcriptionResult && transcriptionResult.errorMessage);
+
+    logWarn('WHATSAPP', 'Falha na transcrição de áudio.', {
+      user: userNumber,
+      errorCode: errorCode || 'audio_unknown_error',
+      errorStatus,
+      errorMessage
+    });
+
+    if (text) {
+      return false;
+    }
+
+    await safeReply(sock, jid, buildAudioFailureMessage(transcriptionResult));
+    return true;
+  }
+
+  const parsingText = sanitizeText([transcript, text].filter(Boolean).join(' '));
+  let transaction = await parseTransactionWithAI(parsingText, referenceDate, {
+    customCategories
+  });
+
+  if (!transaction) {
+    transaction = fallbackParseTransaction(parsingText, referenceDate, {
+      customCategories
+    });
+  }
+
+  if (!transaction) {
+    if (text) {
+      return false;
+    }
+
+    await safeReply(
+      sock,
+      jid,
+      [
+        `Transcrevi seu áudio como: "${buildTranscriptPreview(transcript)}"`,
+        'Mas ainda não consegui identificar valor/categoria/data para salvar.',
+        'Tente falar o valor, a categoria e quando foi o gasto.'
+      ].join('\n')
+    );
+    return true;
+  }
+
+  const explicitCategory = parseCategoryFromText(normalizeCommandText(parsingText), customCategories);
+
+  if (explicitCategory) {
+    transaction.categoria = normalizeCategoryName(explicitCategory, transaction.categoria || 'Outros');
+  }
+
+  await setConversationState(
+    userNumber,
+    {
+      step: 'audio_confirm',
+      data: {
+        transaction,
+        transcript
+      }
+    },
+    CONVERSATION_STATE_TTL_SECONDS
+  );
+
+  await safeReply(
+    sock,
+    jid,
+    buildAudioConfirmationMessage({
+      transcript,
+      transaction
+    })
+  );
+  return true;
+}
+
 function buildNaturalSuccessMessage(profile, transaction, monthSummary) {
   const hasName = profile && profile.name;
   const openers = hasName
@@ -2055,6 +2344,49 @@ function buildReceiptConfirmationMessage(receiptResult) {
     `• Data: ${formatDateBR(transaction.data)}`,
     storeLabel ? `• Estabelecimento: ${storeLabel}` : null,
     `• Confiança: ${confidenceLabel}`,
+    '',
+    'Deseja salvar esse gasto? (sim/não)'
+  ].filter(Boolean).join('\n');
+}
+
+function buildTranscriptPreview(transcript, maxLength = 140) {
+  const clean = sanitizeText(transcript);
+
+  if (!clean) {
+    return '';
+  }
+
+  if (clean.length <= maxLength) {
+    return clean;
+  }
+
+  return `${clean.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
+}
+
+function buildAudioConfirmationMessage(payload) {
+  const transcript = sanitizeText(payload && payload.transcript);
+  const transaction = payload && payload.transaction && typeof payload.transaction === 'object'
+    ? payload.transaction
+    : null;
+
+  if (!transaction) {
+    return [
+      'Não consegui montar o lançamento a partir do áudio.',
+      'Tente novamente em um áudio curto com valor, categoria e data.'
+    ].join('\n');
+  }
+
+  const transcriptLine = transcript
+    ? `• Transcrição: "${buildTranscriptPreview(transcript)}"`
+    : null;
+
+  return [
+    '🎤 Ouvi seu áudio e encontrei:',
+    transcriptLine,
+    `• Valor: ${formatCurrencyBRL(transaction.valor)}`,
+    `• Categoria: ${transaction.categoria}`,
+    `• Descrição: ${transaction.descricao}`,
+    `• Data: ${formatDateBR(transaction.data)}`,
     '',
     'Deseja salvar esse gasto? (sim/não)'
   ].filter(Boolean).join('\n');
@@ -2123,6 +2455,61 @@ function buildReceiptFailureMessage(receiptResult) {
     'Não consegui identificar os dados do comprovante.',
     'Tente reenviar com boa iluminação e o valor total visível.',
     'Se preferir, envie a foto com uma legenda: "valor 465 categoria alimentação".'
+  ].join('\n');
+}
+
+function buildAudioFailureMessage(transcriptionResult) {
+  const errorCode = sanitizeText(transcriptionResult && transcriptionResult.errorCode);
+
+  if (errorCode === 'audio_invalid_input') {
+    return 'Recebi um áudio inválido ou vazio. Tente gravar novamente.';
+  }
+
+  if (errorCode === 'openai_key_missing') {
+    return [
+      'Não consegui transcrever o áudio porque a IA não está configurada.',
+      'Configure a variável OPENAI_KEY no ambiente do bot e reinicie o serviço.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_auth_failed') {
+    return [
+      'Não consegui transcrever o áudio porque a chave da OpenAI foi recusada.',
+      'Verifique o valor de OPENAI_KEY e reinicie o serviço.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_rate_limit') {
+    return [
+      'A OpenAI está com limite de requisições no momento.',
+      'Tente novamente em 1-2 minutos.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_quota_exceeded') {
+    return [
+      'A cota da OpenAI foi excedida para este projeto.',
+      'Revise billing/créditos da API e tente novamente.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_timeout' || errorCode === 'openai_server_error') {
+    return [
+      'A transcrição do áudio demorou demais ou o serviço de IA falhou temporariamente.',
+      'Tente novamente em instantes.'
+    ].join('\n');
+  }
+
+  if (errorCode === 'openai_bad_request') {
+    return [
+      'Não consegui processar esse áudio com o modelo configurado.',
+      'Revise OPENAI_AUDIO_MODEL/OPENAI_AUDIO_FALLBACK_MODEL e tente novamente.'
+    ].join('\n');
+  }
+
+  return [
+    'Não consegui transcrever esse áudio.',
+    'Tente reenviar em um formato comum (ogg/m4a/mp3) e com boa clareza.'
   ].join('\n');
 }
 
@@ -2360,8 +2747,9 @@ async function processIncomingMessage(sock, message) {
 
     const rawText = extractTextMessage(message.message);
     const imageMessage = extractImageMessage(message.message);
+    const audioMessage = extractAudioMessage(message.message);
 
-    if (!rawText && !imageMessage) {
+    if (!rawText && !imageMessage && !audioMessage) {
       return;
     }
 
@@ -2418,7 +2806,7 @@ async function processIncomingMessage(sock, message) {
 
     profile = onboardingResult.profile || profile;
 
-    if (!imageMessage && text) {
+    if (!imageMessage && !audioMessage && text) {
       const receiptConfirmationHandled = await handleReceiptConfirmationFlow(
         sock,
         jid,
@@ -2430,6 +2818,20 @@ async function processIncomingMessage(sock, message) {
       );
 
       if (receiptConfirmationHandled) {
+        return;
+      }
+
+      const audioConfirmationHandled = await handleAudioConfirmationFlow(
+        sock,
+        jid,
+        userNumber,
+        text,
+        referenceDate,
+        profile,
+        conversationState
+      );
+
+      if (audioConfirmationHandled) {
         return;
       }
     }
@@ -2509,6 +2911,23 @@ async function processIncomingMessage(sock, message) {
       );
 
       if (receiptHandled) {
+        return;
+      }
+    }
+
+    if (audioMessage) {
+      const audioHandled = await tryHandleAudioExpense(
+        sock,
+        jid,
+        userNumber,
+        message,
+        audioMessage,
+        text,
+        referenceDate,
+        profile
+      );
+
+      if (audioHandled) {
         return;
       }
     }
